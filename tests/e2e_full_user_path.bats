@@ -103,11 +103,44 @@ write_policy_v2() {
 JSON
 }
 
+install_policy_v1() {
+  prepare_keys
+  write_policy_v1
+  /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
+  /workspace/target/debug/secure-sudoers-utils install >/dev/null
+}
+
+unlock_managed_files() {
+  run /workspace/target/debug/secure-sudoers-utils unlock
+  if [ "$status" -ne 0 ]; then
+    [[ "$output" == *"Some files could not be unlocked"* ]]
+  fi
+}
+
 @test "gen-keys creates keypair files" {
   run bash -lc "cd '$KEYS_DIR' && /workspace/target/debug/secure-sudoers-utils gen-keys"
   [ "$status" -eq 0 ]
   [ -f "$PRIVATE_KEY_PATH" ]
   [ -f "$PUBLIC_KEY_LOCAL_PATH" ]
+}
+
+@test "gen-keys applies expected private/public key permissions" {
+  run bash -lc "cd '$KEYS_DIR' && /workspace/target/debug/secure-sudoers-utils gen-keys"
+  [ "$status" -eq 0 ]
+
+  private_mode="$(stat -c '%a' "$PRIVATE_KEY_PATH")"
+  public_mode="$(stat -c '%a' "$PUBLIC_KEY_LOCAL_PATH")"
+  [ "$private_mode" = "600" ]
+  [ "$public_mode" = "644" ]
+}
+
+@test "gen-keys refuses to overwrite existing keypair files" {
+  run bash -lc "cd '$KEYS_DIR' && /workspace/target/debug/secure-sudoers-utils gen-keys"
+  [ "$status" -eq 0 ]
+
+  run bash -lc "cd '$KEYS_DIR' && /workspace/target/debug/secure-sudoers-utils gen-keys"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Failed to create secure_sudoers_private_key.pem"* ]]
 }
 
 @test "check validates policy before signing" {
@@ -119,6 +152,33 @@ JSON
   [[ "$output" == *"is valid"* ]]
 }
 
+@test "check rejects policy with non-existent real_binary" {
+  prepare_keys
+  cat >"$POLICY_PATH" <<'JSON'
+{
+  "version": "1.0",
+  "serial": 1,
+  "global_settings": {
+    "log_destination": "stdout",
+    "log_format": "text",
+    "admin_contact": "Contact: test-admin@example.com"
+  },
+  "tools": {
+    "badtool": {
+      "id": "badtool-v1",
+      "real_binary": "/definitely/missing/binary",
+      "help_description": "invalid test tool",
+      "parameters": {}
+    }
+  }
+}
+JSON
+
+  run /workspace/target/debug/secure-sudoers-utils check "$POLICY_PATH"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"does not exist on the filesystem"* ]]
+}
+
 @test "sign creates detached signature for policy" {
   prepare_keys
   write_policy_v1
@@ -126,6 +186,15 @@ JSON
   run /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH"
   [ "$status" -eq 0 ]
   [ -f "${POLICY_PATH}.sig" ]
+}
+
+@test "sign fails when private key file is missing" {
+  prepare_keys
+  write_policy_v1
+
+  run /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "${KEYS_DIR}/missing_private_key.pem"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot read"* ]]
 }
 
 @test "install provisions hard-link entry points and sudoers drop-in" {
@@ -145,6 +214,39 @@ JSON
   [ "$echo_identity" = "$binary_identity" ]
   [ "$cat_identity" = "$binary_identity" ]
   [ -f /etc/sudoers.d/secure-sudoers ]
+}
+
+@test "install fails when policy signature is missing" {
+  prepare_keys
+  write_policy_v1
+
+  run /workspace/target/debug/secure-sudoers-utils install
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot read policy signature"* ]]
+}
+
+@test "install rejects policy signed by an untrusted key" {
+  prepare_keys
+  write_policy_v1
+  /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
+
+  mkdir -p "${TEST_ROOT}/alt-keys"
+  run bash -lc "cd '${TEST_ROOT}/alt-keys' && /workspace/target/debug/secure-sudoers-utils gen-keys"
+  [ "$status" -eq 0 ]
+  cp "${TEST_ROOT}/alt-keys/secure_sudoers_public_key.pem" "$PUBLIC_KEY_PATH"
+
+  run /workspace/target/debug/secure-sudoers-utils install
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"verification failed"* ]]
+}
+
+@test "sudoers drop-in contains managed tool entry points" {
+  install_policy_v1
+
+  run grep -F "/usr/local/bin/echo" /etc/sudoers.d/secure-sudoers
+  [ "$status" -eq 0 ]
+  run grep -F "/usr/local/bin/cat" /etc/sudoers.d/secure-sudoers
+  [ "$status" -eq 0 ]
 }
 
 @test "allowed command succeeds under installed policy" {
@@ -169,16 +271,51 @@ JSON
   [[ "$output" == *"Access denied"* ]]
 }
 
+@test "allowed positional path succeeds under policy v1" {
+  install_policy_v1
+
+  run /workspace/target/debug/secure-sudoers cat /etc/hosts
+  [ "$status" -eq 0 ]
+}
+
+@test "missing required verb is denied for configured tool" {
+  install_policy_v1
+
+  run /workspace/target/debug/secure-sudoers echo
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"requires a verb"* ]]
+}
+
+@test "unknown flag is denied for configured tool" {
+  install_policy_v1
+
+  run /workspace/target/debug/secure-sudoers echo ok --unknown-flag=value
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Access denied"* ]]
+}
+
+@test "delimited positional argument allows approved path" {
+  install_policy_v1
+
+  run /workspace/target/debug/secure-sudoers cat -- /etc/hosts
+  [ "$status" -eq 0 ]
+}
+
+@test "delimited positional argument still enforces regex restrictions" {
+  install_policy_v1
+
+  run /workspace/target/debug/secure-sudoers cat -- /etc/passwd
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Access denied"* ]]
+}
+
 @test "unlock permits policy replacement and reinstall" {
   prepare_keys
   write_policy_v1
   /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
   /workspace/target/debug/secure-sudoers-utils install >/dev/null
 
-  run /workspace/target/debug/secure-sudoers-utils unlock
-  if [ "$status" -ne 0 ]; then
-    [[ "$output" == *"Some files could not be unlocked"* ]]
-  fi
+  unlock_managed_files
 
   write_policy_v2
   run /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH"
@@ -196,10 +333,7 @@ JSON
   run /workspace/target/debug/secure-sudoers cat /etc/shadow
   [ "$status" -ne 0 ]
 
-  run /workspace/target/debug/secure-sudoers-utils unlock
-  if [ "$status" -ne 0 ]; then
-    [[ "$output" == *"Some files could not be unlocked"* ]]
-  fi
+  unlock_managed_files
   write_policy_v2
   /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
   /workspace/target/debug/secure-sudoers-utils install >/dev/null
@@ -214,10 +348,7 @@ JSON
   /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
   /workspace/target/debug/secure-sudoers-utils install >/dev/null
 
-  run /workspace/target/debug/secure-sudoers-utils unlock
-  if [ "$status" -ne 0 ]; then
-    [[ "$output" == *"Some files could not be unlocked"* ]]
-  fi
+  unlock_managed_files
   run bash -lc "printf 'corrupt-signature' > '${POLICY_PATH}.sig'"
   [ "$status" -eq 0 ]
   run /workspace/target/debug/secure-sudoers echo ok should-fail
@@ -225,7 +356,26 @@ JSON
   [[ "$output" == *"Cannot load policy"* ]]
 }
 
-@test "symlink invocation works for allowed tool" {
+@test "immutable protection prevents signature overwrite before unlock" {
+  install_policy_v1
+
+  run bash -lc "printf 'corrupt-signature' > '${POLICY_PATH}.sig'"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Operation not permitted"* || "$output" == *"Permission denied"* ]]
+}
+
+@test "unlock allows signature overwrite for maintenance flow" {
+  install_policy_v1
+  unlock_managed_files
+
+  run bash -lc "printf 'corrupt-signature' > '${POLICY_PATH}.sig'"
+  [ "$status" -eq 0 ]
+  run /workspace/target/debug/secure-sudoers echo ok should-fail
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot load policy"* ]]
+}
+
+@test "entry-point invocation works for allowed tool" {
   prepare_keys
   write_policy_v1
   /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
@@ -234,6 +384,13 @@ JSON
   run /usr/local/bin/echo ok via-symlink
   [ "$status" -eq 0 ]
   [[ "$output" == *"via-symlink"* ]]
+}
+
+@test "hard-link invocation works for second configured tool" {
+  install_policy_v1
+
+  run /usr/local/bin/cat /etc/hosts
+  [ "$status" -eq 0 ]
 }
 
 @test "unknown tool is denied and contact is shown" {
@@ -299,6 +456,16 @@ JSON
   [[ "$output" == *"Cannot load policy"* ]]
 }
 
+@test "missing trusted public key is rejected at runtime" {
+  install_policy_v1
+  unlock_managed_files
+  rm -f "$PUBLIC_KEY_PATH"
+
+  run /workspace/target/debug/secure-sudoers echo ok should-fail
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Cannot load policy"* ]]
+}
+
 @test "SUDO_COMMAND mismatch is detected as spoofing" {
   prepare_keys
   write_policy_v1
@@ -310,9 +477,24 @@ JSON
   [[ "$output" == *"Spoofing attempt detected"* ]]
 }
 
+@test "SUDO_COMMAND wrapper without delegated command is detected as spoofing" {
+  install_policy_v1
+
+  run env SUDO_COMMAND="/usr/local/bin/secure-sudoers" /workspace/target/debug/secure-sudoers echo ok hi
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Spoofing attempt detected"* ]]
+}
+
 @test "update command rejects non-https URL" {
   prepare_keys
   run /workspace/target/debug/secure-sudoers-utils update "http://example.invalid/policy.json" "$PUBLIC_KEY_PATH"
   [ "$status" -ne 0 ]
   [[ "$output" == *"URL must use HTTPS"* ]]
+}
+
+@test "update command rejects malformed URL" {
+  prepare_keys
+  run /workspace/target/debug/secure-sudoers-utils update "%%%%" "$PUBLIC_KEY_PATH"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *"Invalid policy URL"* ]]
 }
