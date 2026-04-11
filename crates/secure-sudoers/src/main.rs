@@ -2,7 +2,7 @@
 
 use secure_sudoers::exec::hash_binary_fd;
 use secure_sudoers::helpers::{
-    load_policy, parse_invocation, redact_args, verify_sudo_command_binding,
+    load_policy, parse_invocation_current_process, redact_args, verify_sudo_command_binding,
 };
 use secure_sudoers::supervisor;
 use secure_sudoers_common::telemetry::{
@@ -16,7 +16,6 @@ const POLICY_PATH: &str = "/etc/secure-sudoers/policy.json";
 
 fn main() {
     let txn_id = generate_txn_id();
-    let raw_argv: Vec<String> = std::env::args().collect();
 
     #[cfg(debug_assertions)]
     let policy_path =
@@ -43,7 +42,7 @@ fn main() {
 
     let identity = resolve_identity_triad();
 
-    let (tool_name, raw_args) = match parse_invocation(&raw_argv) {
+    let (tool_name, raw_args) = match parse_invocation_current_process() {
         Ok(res) => res,
         Err(e) => {
             let ev = SecurityEvent {

@@ -8,9 +8,6 @@ Baseline status at audit time:
 
 ## 1) Functional Audit Findings
 
-* SUDO_COMMAND Parsing: While you handle basic spoofing, shlex::split on SUDO_COMMAND is a heuristic. In extremely high-security environments, some might
-  prefer reading from /proc/self/cmdline directly.
-
 ## 2) Niggles & Structural Improvement Areas
 
 ### 13. God-module tendencies in core security paths

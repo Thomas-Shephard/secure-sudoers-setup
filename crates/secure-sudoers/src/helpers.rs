@@ -7,12 +7,54 @@ use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::os::fd::AsRawFd;
 use std::path::Path;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 const PUBLIC_KEY_PATH: &str = "/etc/secure-sudoers/secure_sudoers_public_key.pem";
 
 pub fn parse_invocation(raw_argv: &[String]) -> Result<(String, Vec<String>), Error> {
     parse_invocation_internal(raw_argv, |v| std::env::var(v).ok())
+}
+
+pub fn parse_invocation_current_process() -> Result<(String, Vec<String>), Error> {
+    let raw_argv = match read_proc_self_cmdline() {
+        Ok(argv) => argv,
+        Err(e) => {
+            info!(
+                reason = %e,
+                "Unable to read /proc/self/cmdline; falling back to std::env::args"
+            );
+            std::env::args().collect()
+        }
+    };
+    parse_invocation_internal(&raw_argv, |v| std::env::var(v).ok())
+}
+
+fn read_proc_self_cmdline() -> Result<Vec<String>, Error> {
+    let bytes = std::fs::read("/proc/self/cmdline")
+        .map_err(|e| Error::IoContext("Cannot read /proc/self/cmdline".to_string(), e))?;
+    parse_proc_self_cmdline_bytes(&bytes)
+}
+
+fn parse_proc_self_cmdline_bytes(bytes: &[u8]) -> Result<Vec<String>, Error> {
+    let mut chunks: Vec<&[u8]> = bytes.split(|b| *b == 0).collect();
+    if chunks.last().is_some_and(|chunk| chunk.is_empty()) {
+        chunks.pop();
+    }
+    if chunks.is_empty() {
+        return Err(Error::Validation(
+            "Cannot parse /proc/self/cmdline: missing argv tokens".to_string(),
+        ));
+    }
+
+    let mut argv = Vec::new();
+    for chunk in chunks {
+        let token = std::str::from_utf8(chunk).map_err(|_| {
+            Error::Validation("Cannot parse /proc/self/cmdline: non-UTF8 argv token".to_string())
+        })?;
+        argv.push(token.to_string());
+    }
+
+    Ok(argv)
 }
 
 fn parse_invocation_internal<F>(
@@ -50,23 +92,25 @@ where
 
     match get_env("SUDO_COMMAND") {
         Some(sudo_cmd) => {
-            let tokens = shlex::split(&sudo_cmd).ok_or_else(|| {
-                Error::Spoofing(
-                    "Spoofing attempt detected: invalid SUDO_COMMAND format (shell parsing failed)"
-                        .to_string(),
-                )
-            })?;
-
-            let first_token = tokens.first().map(String::as_str).unwrap_or("");
-            let first_name = basename(first_token);
-
-            let sudo_tool_token = if (first_name == "secure-sudoers"
-                || first_name == "secure_sudoers")
-                && !first_token.is_empty()
-            {
-                tokens.get(1).cloned().unwrap_or_default()
-            } else {
-                first_token.to_string()
+            let sudo_tool_token = match delegated_command_token_from_sudo_command(&sudo_cmd) {
+                Ok(token) => token,
+                Err(SudoCommandTokenError::InvalidPrefix) => {
+                    return Err(Error::Spoofing(
+                        "Spoofing attempt detected: invalid SUDO_COMMAND command prefix"
+                            .to_string(),
+                    ));
+                }
+                Err(SudoCommandTokenError::MissingDelegatedCommand) => {
+                    error!(
+                        argv0 = %raw_argv[0],
+                        sudo_command = %sudo_cmd,
+                        "CRITICAL: Spoofing attempt detected! SUDO_COMMAND missing delegated command."
+                    );
+                    return Err(Error::Spoofing(
+                        "Spoofing attempt detected: SUDO_COMMAND is missing delegated command token"
+                            .to_string(),
+                    ));
+                }
             };
 
             if sudo_tool_token.is_empty() {
@@ -111,6 +155,95 @@ fn basename(token: &str) -> &str {
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or(token)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SudoCommandTokenError {
+    InvalidPrefix,
+    MissingDelegatedCommand,
+}
+
+fn delegated_command_token_from_sudo_command(
+    sudo_cmd: &str,
+) -> Result<String, SudoCommandTokenError> {
+    let first_tokens = split_sudo_command_prefix_tokens(sudo_cmd, 1)
+        .ok_or(SudoCommandTokenError::InvalidPrefix)?;
+    let first_token = first_tokens.first().map(String::as_str).unwrap_or("");
+    let first_name = basename(first_token);
+
+    if (first_name == "secure-sudoers" || first_name == "secure_sudoers") && !first_token.is_empty()
+    {
+        let tokens = split_sudo_command_prefix_tokens(sudo_cmd, 2)
+            .ok_or(SudoCommandTokenError::InvalidPrefix)?;
+        tokens
+            .get(1)
+            .cloned()
+            .ok_or(SudoCommandTokenError::MissingDelegatedCommand)
+    } else {
+        Ok(first_token.to_string())
+    }
+}
+
+fn split_sudo_command_prefix_tokens(s: &str, max_tokens: usize) -> Option<Vec<String>> {
+    if max_tokens == 0 {
+        return Some(Vec::new());
+    }
+
+    let mut chars = s.chars().peekable();
+    let mut tokens = Vec::new();
+    while tokens.len() < max_tokens {
+        while matches!(chars.peek(), Some(ch) if ch.is_whitespace()) {
+            chars.next();
+        }
+        if chars.peek().is_none() {
+            break;
+        }
+
+        let mut token = String::new();
+        let mut quote: Option<char> = None;
+        let mut escaped = false;
+
+        for ch in chars.by_ref() {
+            if escaped {
+                token.push(ch);
+                escaped = false;
+                continue;
+            }
+
+            if ch == '\\' && quote != Some('\'') {
+                escaped = true;
+                continue;
+            }
+
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                } else {
+                    token.push(ch);
+                }
+                continue;
+            }
+
+            if ch == '\'' || ch == '"' {
+                quote = Some(ch);
+                continue;
+            }
+
+            if ch.is_whitespace() {
+                break;
+            }
+
+            token.push(ch);
+        }
+
+        if escaped || quote.is_some() {
+            return None;
+        }
+
+        tokens.push(token);
+    }
+
+    Some(tokens)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,21 +298,25 @@ where
         return Ok(());
     };
 
-    let tokens = shlex::split(&sudo_cmd).ok_or_else(|| {
-        SudoBindingError::new(
-            "Spoofing attempt detected: invalid SUDO_COMMAND format",
-            None,
-        )
-    })?;
-
-    let first_token = tokens.first().map(String::as_str).unwrap_or("");
-    let first_name = basename(first_token);
-    let sudo_tool_token = if (first_name == "secure-sudoers" || first_name == "secure_sudoers")
-        && !first_token.is_empty()
-    {
-        tokens.get(1).cloned().unwrap_or_default()
-    } else {
-        first_token.to_string()
+    let sudo_tool_token = match delegated_command_token_from_sudo_command(&sudo_cmd) {
+        Ok(token) => token,
+        Err(SudoCommandTokenError::InvalidPrefix) => {
+            return Err(SudoBindingError::new(
+                "Spoofing attempt detected: invalid SUDO_COMMAND command prefix",
+                None,
+            ));
+        }
+        Err(SudoCommandTokenError::MissingDelegatedCommand) => {
+            error!(
+                expected_tool = %tool_name,
+                sudo_command = %sudo_cmd,
+                "CRITICAL: Spoofing attempt detected! SUDO_COMMAND missing delegated command."
+            );
+            return Err(SudoBindingError::new(
+                "Spoofing attempt detected: SUDO_COMMAND is missing delegated command token",
+                None,
+            ));
+        }
     };
 
     if sudo_tool_token.is_empty() {
@@ -702,6 +839,30 @@ mod tests {
     }
 
     #[test]
+    fn parse_proc_self_cmdline_bytes_preserves_empty_arguments() {
+        let parsed = parse_proc_self_cmdline_bytes(b"tool\0\0arg\0").unwrap();
+        assert_eq!(parsed, argv(&["tool", "", "arg"]));
+    }
+
+    #[test]
+    fn parse_proc_self_cmdline_bytes_trims_only_final_terminator() {
+        let parsed = parse_proc_self_cmdline_bytes(b"tool\0\0").unwrap();
+        assert_eq!(parsed, argv(&["tool", ""]));
+    }
+
+    #[test]
+    fn split_sudo_command_prefix_preserves_backslash_in_single_quotes() {
+        let parsed = split_sudo_command_prefix_tokens("'a\\b' rest", 2).unwrap();
+        assert_eq!(parsed, argv(&["a\\b", "rest"]));
+    }
+
+    #[test]
+    fn delegated_command_token_reports_missing_wrapper_subcommand() {
+        let parsed = delegated_command_token_from_sudo_command("/usr/local/bin/secure-sudoers");
+        assert_eq!(parsed, Err(SudoCommandTokenError::MissingDelegatedCommand));
+    }
+
+    #[test]
     fn direct_invocation_extracts_tool_and_args() {
         let (tool, args) =
             parse_invocation(&argv(&["secure-sudoers", "apt", "-y", "install"])).unwrap();
@@ -905,6 +1066,48 @@ mod tests {
     }
 
     #[test]
+    fn sudo_command_with_malformed_trailing_args_still_parses_tool_prefix() {
+        let true_path = if Path::new("/usr/bin/true").exists() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        };
+        let sudo_cmd = format!("{true_path} install \"unterminated");
+        let env = |k: &str| -> Option<String> {
+            if k == "SUDO_COMMAND" {
+                Some(sudo_cmd.clone())
+            } else {
+                None
+            }
+        };
+        let (tool, args) =
+            parse_invocation_internal(&argv(&["secure-sudoers", "true", "install"]), env).unwrap();
+        assert_eq!(tool, "true");
+        assert_eq!(args, argv(&["install"]));
+    }
+
+    #[test]
+    fn sudo_command_with_malformed_second_token_still_parses_non_wrapper_prefix() {
+        let true_path = if Path::new("/usr/bin/true").exists() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        };
+        let sudo_cmd = format!("{true_path} \"unterminated");
+        let env = |k: &str| -> Option<String> {
+            if k == "SUDO_COMMAND" {
+                Some(sudo_cmd.clone())
+            } else {
+                None
+            }
+        };
+        let (tool, args) =
+            parse_invocation_internal(&argv(&["secure-sudoers", "true", "install"]), env).unwrap();
+        assert_eq!(tool, "true");
+        assert_eq!(args, argv(&["install"]));
+    }
+
+    #[test]
     fn verify_sudo_command_binding_path_identity_mismatch_detected() {
         let dir = tempfile::TempDir::new().unwrap();
         let left_dir = dir.path().join("left");
@@ -986,6 +1189,46 @@ mod tests {
         let env = |k: &str| -> Option<String> {
             if k == "SUDO_COMMAND" {
                 Some("true install".to_string())
+            } else {
+                None
+            }
+        };
+
+        assert!(verify_sudo_command_binding_internal("true", &expected_binary, env).is_ok());
+    }
+
+    #[test]
+    fn verify_sudo_command_binding_ignores_malformed_trailing_args() {
+        let true_path = if Path::new("/usr/bin/true").exists() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        };
+        let expected_binary = open_path(true_path);
+        let sudo_cmd = format!("{true_path} install \"unterminated");
+        let env = |k: &str| -> Option<String> {
+            if k == "SUDO_COMMAND" {
+                Some(sudo_cmd.clone())
+            } else {
+                None
+            }
+        };
+
+        assert!(verify_sudo_command_binding_internal("true", &expected_binary, env).is_ok());
+    }
+
+    #[test]
+    fn verify_sudo_command_binding_ignores_malformed_second_token_for_non_wrapper() {
+        let true_path = if Path::new("/usr/bin/true").exists() {
+            "/usr/bin/true"
+        } else {
+            "/bin/true"
+        };
+        let expected_binary = open_path(true_path);
+        let sudo_cmd = format!("{true_path} \"unterminated");
+        let env = |k: &str| -> Option<String> {
+            if k == "SUDO_COMMAND" {
+                Some(sudo_cmd.clone())
             } else {
                 None
             }
