@@ -25,7 +25,7 @@ pub fn hash_binary_fd(fd_raw: std::os::unix::io::RawFd) -> Result<String, Error>
         }
         hasher.update(&buf[..n]);
     }
-    Ok(hex::encode(hasher.finalize()))
+    Ok(format!("{:064x}", hasher.finalize()))
 }
 
 pub fn execute_securely(cmd: &ValidatedCommand, policy: &SecureSudoersPolicy) -> Result<(), Error> {

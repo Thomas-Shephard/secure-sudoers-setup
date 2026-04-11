@@ -206,7 +206,7 @@ fn main() {
 fn generate_txn_id() -> String {
     let mut buf = [0u8; 4];
     if unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, 4, 0) } == 4 {
-        hex::encode(buf)
+        format!("{:08x}", u32::from_be_bytes(buf))
     } else {
         // Fallback to XOR pid with current nanoseconds for collision resistance
         use std::time::{SystemTime, UNIX_EPOCH};
