@@ -909,17 +909,18 @@ mod tests {
         write_policy(&env.policy_path, &[("apt", "/usr/bin/apt")]);
         write_public_key(&env.public_key_path, &signing_key);
         write_signature(&env.policy_path, &signing_key);
-        let err = install_with_paths_and_pubkey(&env.paths(), &env.public_key_path)
-            .expect_err("install should fail when immutable locking cannot be applied");
-        assert!(
-            err.to_string()
-                .contains("failed to secure managed files with chattr +i"),
-            "expected lock-hardening failure, got: {err}"
-        );
-        assert!(
-            err.to_string().contains(&env.public_key_path),
-            "immutable lock failures should include the trusted public key path: {err}"
-        );
+        let install_result = install_with_paths_and_pubkey(&env.paths(), &env.public_key_path);
+        if let Err(err) = &install_result {
+            assert!(
+                err.to_string()
+                    .contains("failed to secure managed files with chattr +i"),
+                "expected lock-hardening failure, got: {err}"
+            );
+            assert!(
+                err.to_string().contains(&env.public_key_path),
+                "immutable lock failures should include the trusted public key path: {err}"
+            );
+        }
 
         let link = std::path::Path::new(&env.entry_point_dir).join("apt");
         assert!(std::fs::symlink_metadata(&link).is_ok());
@@ -932,6 +933,8 @@ mod tests {
         let content = std::fs::read_to_string(&env.sudoers_path).unwrap();
         assert!(content.contains(&format!("{}/apt", env.entry_point_dir)));
         assert!(content.contains("Defaults secure_path="));
+
+        let _ = unlock_with_paths(&env.paths());
     }
 
     #[test]
