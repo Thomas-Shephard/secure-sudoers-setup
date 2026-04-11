@@ -128,15 +128,22 @@ JSON
   [ -f "${POLICY_PATH}.sig" ]
 }
 
-@test "install provisions symlinks and sudoers drop-in" {
+@test "install provisions hard-link entry points and sudoers drop-in" {
   prepare_keys
   write_policy_v1
   /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
 
   run /workspace/target/debug/secure-sudoers-utils install
   [ "$status" -eq 0 ]
-  [ -L /usr/local/bin/echo ]
-  [ -L /usr/local/bin/cat ]
+  [ -f /usr/local/bin/echo ]
+  [ -f /usr/local/bin/cat ]
+  [ ! -L /usr/local/bin/echo ]
+  [ ! -L /usr/local/bin/cat ]
+  echo_identity="$(stat -c '%d:%i' /usr/local/bin/echo)"
+  cat_identity="$(stat -c '%d:%i' /usr/local/bin/cat)"
+  binary_identity="$(stat -c '%d:%i' /usr/local/bin/secure-sudoers)"
+  [ "$echo_identity" = "$binary_identity" ]
+  [ "$cat_identity" = "$binary_identity" ]
   [ -f /etc/sudoers.d/secure-sudoers ]
 }
 
@@ -207,7 +214,12 @@ JSON
   /workspace/target/debug/secure-sudoers-utils sign "$POLICY_PATH" "$PRIVATE_KEY_PATH" >/dev/null
   /workspace/target/debug/secure-sudoers-utils install >/dev/null
 
-  printf 'corrupt-signature' > "${POLICY_PATH}.sig"
+  run /workspace/target/debug/secure-sudoers-utils unlock
+  if [ "$status" -ne 0 ]; then
+    [[ "$output" == *"Some files could not be unlocked"* ]]
+  fi
+  run bash -lc "printf 'corrupt-signature' > '${POLICY_PATH}.sig'"
+  [ "$status" -eq 0 ]
   run /workspace/target/debug/secure-sudoers echo ok should-fail
   [ "$status" -ne 0 ]
   [[ "$output" == *"Cannot load policy"* ]]

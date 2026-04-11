@@ -15,9 +15,3 @@ Baseline status at audit time:
 2. **Issue:** Multiple responsibilities packed into single large modules.
 3. **Impact:** Harder auditing, review overhead, and increased regression probability.
 4. **Suggested Direction:** Split by concern (invocation parsing, policy loading, redaction, mount ops, installer IO).
-
-### 15. Dependency surface can be tightened in `secure-sudoers`
-1. **Location:** `crates/secure-sudoers/Cargo.toml`
-2. **Issue:** Some dependencies appear heavier than runtime requirements (e.g., keygen/testing-oriented crates in runtime crate).
-3. **Impact:** Larger attack surface and maintenance overhead.
-4. **Suggested Direction:** Re-audit runtime vs dev usage and move non-runtime crates to `dev-dependencies` where possible.
