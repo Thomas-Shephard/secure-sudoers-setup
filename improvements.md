@@ -21,9 +21,3 @@ Baseline status at audit time:
 2. **Issue:** Some dependencies appear heavier than runtime requirements (e.g., keygen/testing-oriented crates in runtime crate).
 3. **Impact:** Larger attack surface and maintenance overhead.
 4. **Suggested Direction:** Re-audit runtime vs dev usage and move non-runtime crates to `dev-dependencies` where possible.
-
-### 16. Critical network update path lacks dedicated automated tests
-1. **Location:** `crates/secure-sudoers-utils/src/modules/network.rs` and test suite coverage
-2. **Issue:** No focused unit/integration tests for update success/failure matrix (downgrade, oversize body, bad sig, atomic replacement behavior).
-3. **Impact:** Elevated regression risk in a security-sensitive update mechanism.
-4. **Suggested Direction:** Add module-level tests with local HTTP fixtures and explicit rollback/assertion checks.
