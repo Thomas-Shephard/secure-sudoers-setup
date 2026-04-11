@@ -1,9 +1,10 @@
 #![cfg(target_os = "linux")]
 
 use secure_sudoers::exec::hash_binary_fd;
-use secure_sudoers::helpers::{
-    load_policy, parse_invocation_current_process, redact_args, verify_sudo_command_binding,
-};
+use secure_sudoers::helpers::binding::verify_sudo_command_binding;
+use secure_sudoers::helpers::invocation::parse_invocation_current_process;
+use secure_sudoers::helpers::policy::load_policy;
+use secure_sudoers::helpers::redaction::redact_args;
 use secure_sudoers::supervisor;
 use secure_sudoers_common::telemetry::{
     self, AccountType, ContextInfo, IdentityInfo, PolicyInfo, SecurityEvent,

@@ -315,7 +315,7 @@ fn restore_immutable_if_needed(
         return Ok(());
     }
 
-    let errors = super::installer::chattr_op("+i", &targets);
+    let errors = super::installer::immutable::chattr_op("+i", &targets);
     if errors.is_empty() {
         Ok(())
     } else {
@@ -360,7 +360,7 @@ fn restore_signature(
             tmp.as_file().sync_all()?;
             tmp.persist(sig_path).map_err(|e| e.error)?;
             if previous_sig_was_immutable {
-                let errors = super::installer::chattr_op("+i", &[sig_path]);
+                let errors = super::installer::immutable::chattr_op("+i", &[sig_path]);
                 if !errors.is_empty() {
                     return Err(std::io::Error::other(format!(
                         "failed to restore immutable attribute (+i): {}",

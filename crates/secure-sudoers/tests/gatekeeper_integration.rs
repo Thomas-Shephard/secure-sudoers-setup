@@ -1,4 +1,4 @@
-use secure_sudoers::helpers;
+use secure_sudoers::helpers::invocation::parse_invocation;
 
 #[test]
 fn test_invocation_mapping() {
@@ -7,7 +7,7 @@ fn test_invocation_mapping() {
         "apt".to_string(),
         "update".to_string(),
     ];
-    let (tool, cmd_args) = helpers::parse_invocation(&args).expect("Valid invocation");
+    let (tool, cmd_args) = parse_invocation(&args).expect("Valid invocation");
     assert_eq!(tool, "apt");
     assert_eq!(cmd_args, vec!["update"]);
 
@@ -16,7 +16,7 @@ fn test_invocation_mapping() {
         "-f".to_string(),
         "log".to_string(),
     ];
-    let (tool2, cmd_args2) = helpers::parse_invocation(&symlink_args).expect("Valid invocation");
+    let (tool2, cmd_args2) = parse_invocation(&symlink_args).expect("Valid invocation");
     assert_eq!(tool2, "tail");
     assert_eq!(cmd_args2, vec!["-f", "log"]);
 }

@@ -347,9 +347,11 @@ fn forward_winsize_with_child_tty(
         return Ok(());
     }
 
-    if let Some(child_tty) = child_tty
-        && child_tty.needs_winsize_sync
-    {
+    let Some(child_tty) = child_tty else {
+        return send_signal_to_process_group(child.as_raw(), libc::SIGWINCH);
+    };
+
+    if child_tty.needs_winsize_sync {
         use std::os::fd::AsRawFd;
         let mut child_ws: libc::winsize = unsafe { std::mem::zeroed() };
         if unsafe { libc::ioctl(child_tty.fd.as_raw_fd(), libc::TIOCGWINSZ, &mut child_ws) } == 0
@@ -358,8 +360,10 @@ fn forward_winsize_with_child_tty(
                 || child_ws.ws_xpixel != ws.ws_xpixel
                 || child_ws.ws_ypixel != ws.ws_ypixel)
         {
-            let _ = unsafe { libc::ioctl(child_tty.fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) };
-            return Ok(());
+            // Successful TIOCSWINSZ typically triggers kernel SIGWINCH delivery for the tty.
+            if unsafe { libc::ioctl(child_tty.fd.as_raw_fd(), libc::TIOCSWINSZ, &ws) } == 0 {
+                return Ok(());
+            }
         }
     }
 

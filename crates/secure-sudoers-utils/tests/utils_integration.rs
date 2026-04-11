@@ -3,7 +3,7 @@ use secure_sudoers_utils::modules::installer;
 #[test]
 fn test_sudoers_generation() {
     let tools = vec!["apt".to_string(), "systemctl".to_string()];
-    let content = installer::generate_sudoers_content(&tools);
+    let content = installer::sudoers_io::generate_sudoers_content(&tools);
 
     assert!(content.contains("/usr/local/bin/apt"));
     assert!(content.contains("/usr/local/bin/systemctl"));

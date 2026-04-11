@@ -32,7 +32,8 @@ pub fn execute_securely(cmd: &ValidatedCommand, policy: &SecureSudoersPolicy) ->
     use std::os::fd::AsRawFd;
 
     // Use the already opened FD from the validation phase to prevent TOCTOU
-    let binary_fd_raw = unsafe { libc::dup(cmd.binary().fd.as_raw_fd()) };
+    let binary_fd_raw =
+        unsafe { libc::fcntl(cmd.binary().fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if binary_fd_raw < 0 {
         return Err(Error::IoContext(
             "fexecve open failed".to_string(),
@@ -43,14 +44,9 @@ pub fn execute_securely(cmd: &ValidatedCommand, policy: &SecureSudoersPolicy) ->
 
     let clean_env = build_scrubbed_env(cmd.env_whitelist());
 
-    crate::isolation::setup_isolation(
-        cmd.isolation(),
-        &policy.global_settings.blocked_paths,
-        cmd.binary(),
-        cmd.args(),
-    )?;
+    crate::isolation::setup_isolation(cmd.isolation(), &policy.global_settings.blocked_paths)?;
 
-    crate::isolation::drop_capabilities()?;
+    crate::isolation::capabilities::drop_capabilities()?;
 
     let binary_name = Path::new(&cmd.binary().path)
         .file_name()

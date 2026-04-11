@@ -1,456 +1,33 @@
-use nix::mount::{MsFlags, mount};
-use nix::sched::{CloneFlags, unshare};
+pub(crate) mod capabilities;
+mod mounts;
+mod path_guard;
+
 use secure_sudoers_common::error::Error;
-use secure_sudoers_common::models::{IsolationSettings, SecurePath};
-use secure_sudoers_common::validator::ValidatedArg;
-use std::io::Error as IoError;
-pub use std::os::fd::AsRawFd;
+use secure_sudoers_common::models::IsolationSettings;
+
+#[cfg(test)]
+use capabilities::{drop_bounding_capabilities_with, drop_capabilities, parse_cap_last_cap};
+#[cfg(test)]
+use mounts::{apply_private_mounts_with, apply_readonly_mounts_with, mount_shadow_fd};
+#[cfg(test)]
+use nix::mount::{MsFlags, mount};
+#[cfg(test)]
+use nix::sched::{CloneFlags, unshare};
+#[cfg(test)]
+use path_guard::{ensure_path_matches_fd, safe_traverse};
+#[cfg(test)]
+use std::os::fd::AsRawFd;
 
 pub fn setup_isolation(
     settings: &IsolationSettings,
     blocked_paths: &[String],
-    _cmd_binary: &SecurePath,
-    _cmd_args: &[ValidatedArg],
 ) -> Result<(), Error> {
-    unshare_namespaces(settings)?;
-    make_root_private()?;
-    apply_private_mounts(&settings.private_mounts)?;
-    apply_blocked_paths(blocked_paths)?;
-    apply_readonly_mounts(&settings.readonly_mounts)?;
+    mounts::unshare_namespaces(settings)?;
+    mounts::make_root_private()?;
+    mounts::apply_private_mounts(&settings.private_mounts)?;
+    mounts::apply_blocked_paths(blocked_paths)?;
+    mounts::apply_readonly_mounts(&settings.readonly_mounts)?;
     Ok(())
-}
-
-fn proc_fd_path(fd: i32) -> String {
-    format!("/proc/self/fd/{fd}")
-}
-
-fn fstat_for_fd(fd: i32, context_path: &str) -> Result<libc::stat, Error> {
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return Err(Error::IoContext(
-            format!("fstat failed on '{}'", context_path),
-            IoError::last_os_error(),
-        ));
-    }
-    Ok(st)
-}
-
-fn ensure_path_matches_fd(path_str: &str, expected_fd: i32) -> Result<(), Error> {
-    let current_fd = safe_traverse(path_str, false)?;
-    let expected = fstat_for_fd(expected_fd, path_str)?;
-    let current = fstat_for_fd(current_fd.as_raw_fd(), path_str)?;
-
-    if expected.st_dev != current.st_dev || expected.st_ino != current.st_ino {
-        return Err(Error::Security(format!(
-            "Security failure: path '{}' changed after verification",
-            path_str
-        )));
-    }
-    Ok(())
-}
-
-fn mount_shadow_fd(fd: i32, original_path: &str) -> Result<(), Error> {
-    let st = fstat_for_fd(fd, original_path)?;
-    ensure_path_matches_fd(original_path, fd)?;
-    let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
-
-    if is_dir {
-        mount(
-            Some("tmpfs"),
-            original_path,
-            Some("tmpfs"),
-            MsFlags::empty(),
-            None::<&str>,
-        )
-        .map_err(|e| {
-            Error::IoContext(
-                format!(
-                    "Security failure: tmpfs mount on blocked dir '{}' failed",
-                    original_path
-                ),
-                IoError::from(e),
-            )
-        })?;
-    } else {
-        mount(
-            Some("/dev/null"),
-            original_path,
-            None::<&str>,
-            MsFlags::MS_BIND,
-            None::<&str>,
-        )
-        .map_err(|e| {
-            Error::IoContext(
-                format!(
-                    "Security failure: bind mount /dev/null on blocked file '{}' failed",
-                    original_path
-                ),
-                IoError::from(e),
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn safe_traverse(path_str: &str, create: bool) -> Result<std::os::fd::OwnedFd, Error> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-
-    let path = std::path::Path::new(path_str);
-    if !path.is_absolute() {
-        return Err(Error::Security(format!(
-            "Security failure: path '{}' is not absolute",
-            path_str
-        )));
-    }
-
-    let root_c =
-        std::ffi::CString::new("/").map_err(|_| Error::System("Nul byte in root path".into()))?;
-    let root_raw = unsafe {
-        libc::open(
-            root_c.as_ptr(),
-            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if root_raw < 0 {
-        return Err(Error::IoContext(
-            "Security failure: cannot open root".to_string(),
-            IoError::last_os_error(),
-        ));
-    }
-    let mut current_fd: OwnedFd = unsafe { OwnedFd::from_raw_fd(root_raw) };
-
-    let components: Vec<_> = path.components().skip(1).collect();
-    for (i, comp) in components.iter().enumerate() {
-        let comp_str = comp
-            .as_os_str()
-            .to_str()
-            .ok_or_else(|| Error::Validation("Invalid path component".to_string()))?;
-        let c_comp = std::ffi::CString::new(comp_str)
-            .map_err(|_| Error::Validation("Nul byte in path component".to_string()))?;
-        let is_last = i == components.len() - 1;
-
-        let next_raw = unsafe {
-            libc::openat(
-                current_fd.as_raw_fd(),
-                c_comp.as_ptr(),
-                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-
-        if next_raw >= 0 {
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            if unsafe { libc::fstat(next_raw, &mut st) } != 0 {
-                let err = IoError::last_os_error();
-                unsafe { libc::close(next_raw) };
-                return Err(Error::IoContext(
-                    format!(
-                        "Security failure: fstat failed on component '{}' of '{}'",
-                        comp_str, path_str
-                    ),
-                    err,
-                ));
-            }
-
-            if (st.st_mode & libc::S_IFMT) == libc::S_IFLNK {
-                unsafe { libc::close(next_raw) };
-                return Err(Error::Security(format!(
-                    "Security failure: symlink detected during traversal of '{}' at '{}'",
-                    path_str, comp_str
-                )));
-            }
-
-            current_fd = unsafe { OwnedFd::from_raw_fd(next_raw) };
-        } else {
-            let err = IoError::last_os_error();
-            if err.raw_os_error() == Some(libc::ELOOP) {
-                return Err(Error::Security(format!(
-                    "Security failure: symlink detected during traversal of '{}' at '{}'",
-                    path_str, comp_str
-                )));
-            }
-
-            if err.kind() != std::io::ErrorKind::NotFound || !create {
-                return Err(Error::IoContext(
-                    format!(
-                        "Security failure: error traversing '{}' at '{}'",
-                        path_str, comp_str
-                    ),
-                    err,
-                ));
-            }
-
-            if is_last && !path_str.ends_with('/') {
-                let fd = unsafe {
-                    libc::openat(
-                        current_fd.as_raw_fd(),
-                        c_comp.as_ptr(),
-                        libc::O_WRONLY
-                            | libc::O_CREAT
-                            | libc::O_EXCL
-                            | libc::O_NOFOLLOW
-                            | libc::O_CLOEXEC,
-                        0o000u32,
-                    )
-                };
-                if fd < 0 {
-                    let e2 = IoError::last_os_error();
-                    if e2.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(Error::IoContext(
-                            format!("Security failure: cannot create mask file '{}'", path_str),
-                            e2,
-                        ));
-                    }
-                } else {
-                    unsafe { libc::close(fd) };
-                }
-            } else {
-                let ret = unsafe { libc::mkdirat(current_fd.as_raw_fd(), c_comp.as_ptr(), 0o000) };
-                if ret != 0 {
-                    let e2 = IoError::last_os_error();
-                    if e2.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(Error::IoContext(
-                            format!("Security failure: cannot create mask dir '{}'", path_str),
-                            e2,
-                        ));
-                    }
-                }
-            }
-
-            let next_raw2 = unsafe {
-                libc::openat(
-                    current_fd.as_raw_fd(),
-                    c_comp.as_ptr(),
-                    libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                )
-            };
-            if next_raw2 < 0 {
-                return Err(Error::IoContext(
-                    format!(
-                        "Security failure: cannot open component '{}' of '{}' after creation",
-                        comp_str, path_str
-                    ),
-                    IoError::last_os_error(),
-                ));
-            }
-            current_fd = unsafe { OwnedFd::from_raw_fd(next_raw2) };
-        }
-    }
-    Ok(current_fd)
-}
-
-fn apply_blocked_paths(paths: &[String]) -> Result<(), Error> {
-    for path_str in paths {
-        let fd = safe_traverse(path_str, true)?;
-        mount_shadow_fd(fd.as_raw_fd(), path_str)?;
-    }
-    Ok(())
-}
-
-fn unshare_namespaces(settings: &IsolationSettings) -> Result<(), Error> {
-    let mut flags = CloneFlags::CLONE_NEWNS;
-    if settings.unshare_network {
-        flags |= CloneFlags::CLONE_NEWNET;
-    }
-    if settings.unshare_pid {
-        flags |= CloneFlags::CLONE_NEWPID;
-    }
-    if settings.unshare_ipc {
-        flags |= CloneFlags::CLONE_NEWIPC;
-    }
-    if settings.unshare_uts {
-        flags |= CloneFlags::CLONE_NEWUTS;
-    }
-    unshare(flags)
-        .map_err(|e| Error::IoContext(format!("unshare({flags:?}) failed"), IoError::from(e)))
-}
-
-fn make_root_private() -> Result<(), Error> {
-    mount(
-        None::<&str>,
-        "/",
-        None::<&str>,
-        MsFlags::MS_PRIVATE | MsFlags::MS_REC,
-        None::<&str>,
-    )
-    .map_err(|e| {
-        Error::IoContext(
-            "remount '/' as MS_PRIVATE|MS_REC failed".to_string(),
-            IoError::from(e),
-        )
-    })
-}
-
-fn apply_private_mounts(paths: &[String]) -> Result<(), Error> {
-    apply_private_mounts_with(
-        paths,
-        |_| Ok(()),
-        |source, target, fstype, flags| {
-            mount(source, target, fstype, flags, None::<&str>)
-                .map_err(|e| Error::Io(IoError::from(e)))
-        },
-    )
-}
-
-fn apply_private_mounts_with<BeforeMount, MountFn>(
-    paths: &[String],
-    mut before_mount: BeforeMount,
-    mut mount_fn: MountFn,
-) -> Result<(), Error>
-where
-    BeforeMount: FnMut(&str) -> Result<(), Error>,
-    MountFn: FnMut(Option<&str>, &str, Option<&str>, MsFlags) -> Result<(), Error>,
-{
-    for path_str in paths {
-        let fd = safe_traverse(path_str, false)?;
-        before_mount(path_str)?;
-        ensure_path_matches_fd(path_str, fd.as_raw_fd())?;
-        mount_fn(
-            Some("tmpfs"),
-            path_str.as_str(),
-            Some("tmpfs"),
-            MsFlags::empty(),
-        )?;
-    }
-    Ok(())
-}
-
-fn apply_readonly_mounts(paths: &[String]) -> Result<(), Error> {
-    apply_readonly_mounts_with(
-        paths,
-        |_| Ok(()),
-        |source, target, fstype, flags| {
-            mount(source, target, fstype, flags, None::<&str>)
-                .map_err(|e| Error::Io(IoError::from(e)))
-        },
-    )
-}
-
-fn apply_readonly_mounts_with<BeforeMount, MountFn>(
-    paths: &[String],
-    mut before_mount: BeforeMount,
-    mut mount_fn: MountFn,
-) -> Result<(), Error>
-where
-    BeforeMount: FnMut(&str) -> Result<(), Error>,
-    MountFn: FnMut(Option<&str>, &str, Option<&str>, MsFlags) -> Result<(), Error>,
-{
-    for path_str in paths {
-        let fd = safe_traverse(path_str, false)?;
-        before_mount(path_str)?;
-        ensure_path_matches_fd(path_str, fd.as_raw_fd())?;
-        let mount_source = proc_fd_path(fd.as_raw_fd());
-        mount_fn(
-            Some(mount_source.as_str()),
-            path_str.as_str(),
-            None,
-            MsFlags::MS_BIND,
-        )?;
-
-        mount_fn(
-            Some(path_str.as_str()),
-            path_str.as_str(),
-            None,
-            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
-        )?;
-    }
-    Ok(())
-}
-
-pub fn drop_capabilities() -> Result<(), Error> {
-    let last_cap = read_cap_last_cap()?;
-    drop_bounding_capabilities_with(last_cap, |cap| {
-        let ret = unsafe { libc::prctl(libc::PR_CAPBSET_DROP, cap as libc::c_ulong, 0, 0, 0) };
-        if ret == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    })?;
-
-    #[repr(C)]
-    struct CapHeader {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    struct CapData {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-
-    let header = CapHeader {
-        version: 0x20080522, // _LINUX_CAPABILITY_VERSION_3
-        pid: 0,
-    };
-    let data = [
-        CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        },
-        CapData {
-            effective: 0,
-            permitted: 0,
-            inheritable: 0,
-        },
-    ];
-
-    let ret = unsafe {
-        libc::syscall(
-            libc::SYS_capset,
-            &header as *const CapHeader,
-            &data as *const CapData,
-        )
-    };
-
-    if ret != 0 {
-        return Err(Error::IoContext(
-            "Security failure: capset failed".to_string(),
-            IoError::last_os_error(),
-        ));
-    }
-
-    Ok(())
-}
-
-fn drop_bounding_capabilities_with<F>(last_cap: u32, mut drop_one: F) -> Result<(), Error>
-where
-    F: FnMut(u32) -> Result<(), IoError>,
-{
-    for cap in 0..=last_cap {
-        if let Err(err) = drop_one(cap) {
-            tracing::error!(
-                capability = cap,
-                error = %err,
-                "Capability bounding-set drop failed"
-            );
-            return Err(Error::IoContext(
-                format!("Security failure: PR_CAPBSET_DROP failed for capability {cap}"),
-                err,
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn read_cap_last_cap() -> Result<u32, Error> {
-    let cap_last_cap = std::fs::read_to_string("/proc/sys/kernel/cap_last_cap").map_err(|e| {
-        Error::IoContext(
-            "Security failure: cannot read /proc/sys/kernel/cap_last_cap".to_string(),
-            e,
-        )
-    })?;
-    parse_cap_last_cap(&cap_last_cap)
-}
-
-fn parse_cap_last_cap(value: &str) -> Result<u32, Error> {
-    let trimmed = value.trim();
-    trimmed.parse::<u32>().map_err(|e| {
-        Error::System(format!(
-            "Security failure: invalid /proc/sys/kernel/cap_last_cap value '{trimmed}': {e}"
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -459,7 +36,6 @@ mod tests {
     use crate::require_root;
     use crate::testing::in_fork;
     use secure_sudoers_common::models::IsolationSettings;
-    use secure_sudoers_common::testing::fixtures::open_path;
 
     fn mount_only_settings() -> IsolationSettings {
         IsolationSettings {
@@ -489,8 +65,7 @@ mod tests {
             let guard = GLOBAL_PATH.lock().unwrap();
             let secret_path = guard.as_ref().unwrap();
             let settings = mount_only_settings();
-            let binary = open_path("/usr/bin/true");
-            match setup_isolation(&settings, std::slice::from_ref(secret_path), &binary, &[]) {
+            match setup_isolation(&settings, std::slice::from_ref(secret_path)) {
                 Err(e) => {
                     eprintln!("  setup_isolation failed: {e}");
                     false
@@ -529,8 +104,7 @@ mod tests {
                 private_mounts: vec![],
                 readonly_mounts: vec![dir_path.clone()],
             };
-            let binary = open_path("/usr/bin/true");
-            match setup_isolation(&settings, &[], &binary, &[]) {
+            match setup_isolation(&settings, &[]) {
                 Err(e) => {
                     eprintln!("  setup_isolation failed: {e}");
                     false
@@ -552,8 +126,7 @@ mod tests {
 
         fn child_fn() -> bool {
             let settings = mount_only_settings();
-            let binary = open_path("/usr/bin/true");
-            match setup_isolation(&settings, &[], &binary, &[]) {
+            match setup_isolation(&settings, &[]) {
                 Err(e) => {
                     eprintln!("  setup_isolation failed: {e}");
                     false
@@ -685,8 +258,7 @@ mod tests {
             let guard = GLOBAL_PATH.lock().unwrap();
             let link_path = guard.as_ref().unwrap();
             let settings = mount_only_settings();
-            let binary = open_path("/usr/bin/true");
-            let res = setup_isolation(&settings, std::slice::from_ref(link_path), &binary, &[]);
+            let res = setup_isolation(&settings, std::slice::from_ref(link_path));
             matches!(
                 res,
                 Err(ref e) if e.to_string().contains("symlink detected")
