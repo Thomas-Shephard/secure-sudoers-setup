@@ -8,12 +8,6 @@ Baseline status at audit time:
 
 ## 1) Functional Audit Findings
 
-### 12. Installer and unlock robustness around signed policy lifecycle
-1. **Location:** `crates/secure-sudoers-utils/src/modules/installer.rs` (`install_with_paths`, `unlock_with_paths`)
-2. **Issue:** `install` validates JSON but does not verify signature; `unlock` depends on readable/parseable policy.
-3. **Impact:** Operational DoS risks and weaker integrity guarantees during lifecycle operations.
-4. **Suggested Direction:** Verify signature in installer path and make unlock resilient even when policy parsing fails.
-
 * SUDO_COMMAND Parsing: While you handle basic spoofing, shlex::split on SUDO_COMMAND is a heuristic. In extremely high-security environments, some might
   prefer reading from /proc/self/cmdline directly.
 

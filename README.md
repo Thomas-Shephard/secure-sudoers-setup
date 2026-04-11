@@ -13,7 +13,7 @@ The tool is intended to replace traditional access to sudo by enforcing the **pr
 - **Security Telemetry**: Every command attempt emits a structured JSON security event to `LOG_AUTHPRIV`, providing immutable audit trails.
 
 ## How It Works
-1. **Invocation**: Run a symlink (e.g., `/usr/local/bin/apt`) that points to the `secure-sudoers` binary.
+1. **Invocation**: Run a managed tool entry point (e.g., `/usr/local/bin/apt`) that hard-links to the `secure-sudoers` binary.
 2. **Identification**: The binary identifies the tool name from the calling context.
 3. **Verification**: The system loads the signed JSON policy and verifies it against the trusted public key.
 4. **Validation**: Arguments are matched against the rules in the policy.
@@ -54,29 +54,33 @@ Once the policy is ready, sign it using the private key:
 sudo secure-sudoers-utils sign /etc/secure-sudoers/policy.json ./secure_sudoers_private_key.pem
 ```
 This creates `/etc/secure-sudoers/policy.json.sig`.
+The signature file is stored as raw 64-byte Ed25519 signature bytes.
 
 ### 4. Install the Environment
-Deploy the configuration and set up symlinks:
+Deploy the configuration and set up tool entry points:
 ```bash
 sudo secure-sudoers-utils install
 ```
 This command performs the following actions:
-- Creates symlinks in `/usr/local/bin` for every tool defined in your policy.
+- Verifies `policy.json.sig` against `/etc/secure-sudoers/secure_sudoers_public_key.pem` before applying any changes.
+- Creates hard-link tool entry points in `/usr/local/bin` for every tool defined in your policy.
 - Writes a secure sudoers drop-in to `/etc/sudoers.d/secure-sudoers`.
-- Protects the binaries, configuration, and symlinks with the immutable bit (`chattr +i`).
+- Protects the binaries, policy JSON, policy signature, trusted public key, sudoers drop-in, and hard-link tool entry points with the immutable bit (`chattr +i`).
+- Returns an error if immutable hardening cannot be applied to all managed files.
+- May leave partial changes when an installation error occurs; run `unlock`, correct the issue, and re-run `install`.
 
 ## Administration Utility
 
 The `secure-sudoers-utils` tool provides several subcommands to manage the system:
 
-| Command                         | Description                                                                            |
-|---------------------------------|----------------------------------------------------------------------------------------|
-| `gen-keys`                      | Generates a new Ed25519 keypair.                                                       |
-| `sign <policy_path> <key_path>` | Signs a policy JSON file with a private key.                                           |
-| `check <policy_path>`           | Validates a policy JSON file for correctness and best practices.                       |
-| `install`                       | Sets up symlinks and sudoers configuration (requires `policy.json` and its signature). |
-| `unlock`                        | Removes the immutable bit from all managed files to allow for updates.                 |
-| `update <url> <pubkey_path>`    | Securely fetches and verifies policy updates over HTTPS.                               |
+| Command                         | Description                                                                                                         |
+|---------------------------------|---------------------------------------------------------------------------------------------------------------------|
+| `gen-keys`                      | Generates a new Ed25519 keypair.                                                                                    |
+| `sign <policy_path> <key_path>` | Signs a policy JSON file with a private key.                                                                        |
+| `check <policy_path>`           | Validates a policy JSON file for correctness and best practices.                                                    |
+| `install`                       | Sets up hard-link tool entry points and sudoers configuration (requires `policy.json`, `policy.json.sig`, and `/etc/secure-sudoers/secure_sudoers_public_key.pem`). |
+| `unlock`                        | Removes the immutable bit from all managed files to allow for updates.                                              |
+| `update <url> <pubkey_path>`    | Securely fetches and verifies policy updates over HTTPS.                                                            |
 
 ### Updating Policies
 To update your configuration, you must first unlock the files:
