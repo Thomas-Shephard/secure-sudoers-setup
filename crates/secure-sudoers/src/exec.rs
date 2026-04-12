@@ -6,6 +6,7 @@ use secure_sudoers_common::error::Error;
 use secure_sudoers_common::models::SecureSudoersPolicy;
 use secure_sudoers_common::validator::ValidatedCommand;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::ffi::CString;
 use std::io::Read;
 use std::os::fd::FromRawFd;
@@ -57,6 +58,10 @@ pub fn execute_securely(
         .inspect_err(|_e| {
             mark_exec_failure(error_stage_fd);
         })?;
+
+    pin_validated_path_arguments(cmd).inspect_err(|_e| {
+        mark_exec_failure(error_stage_fd);
+    })?;
 
     crate::isolation::capabilities::drop_capabilities().inspect_err(|_e| {
         mark_exec_failure(error_stage_fd);
@@ -183,6 +188,39 @@ pub fn execute_securely(
     }
 }
 
+fn pin_validated_path_arguments(cmd: &ValidatedCommand) -> Result<(), Error> {
+    pin_validated_path_arguments_with(cmd, |fd, canonical_path| {
+        crate::isolation::pin_validated_path_argument(fd, canonical_path)
+    })
+}
+
+fn pin_validated_path_arguments_with<PinFn>(
+    cmd: &ValidatedCommand,
+    mut pin_fn: PinFn,
+) -> Result<(), Error>
+where
+    PinFn: FnMut(libc::c_int, &str) -> Result<(), Error>,
+{
+    use std::os::fd::AsRawFd;
+
+    // Deduplicate identical canonical path strings; each unique argv path
+    // string is pinned once for all of its occurrences.
+    let mut seen_paths = HashSet::<&str>::new();
+    for arg in cmd.args() {
+        let Some(path_arg) = arg.path() else {
+            continue;
+        };
+        let canonical_path = path_arg.path.as_str();
+
+        if !seen_paths.insert(canonical_path) {
+            continue;
+        }
+
+        pin_fn(path_arg.fd.as_raw_fd(), canonical_path)?;
+    }
+    Ok(())
+}
+
 const EXEC_STAGE_FAILURE: &[u8] = b"execute_securely";
 
 fn mark_exec_failure(error_stage_fd: Option<libc::c_int>) {
@@ -292,7 +330,12 @@ pub fn build_scrubbed_env(whitelist: &[String]) -> Vec<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secure_sudoers_common::fs::check_path;
+    use secure_sudoers_common::models::{IsolationSettings, ValidationContext};
+    use secure_sudoers_common::validator::{ValidatedArg, ValidatedCommand};
     use std::sync::Mutex;
+    use tempfile::tempdir;
+
     fn wl(keys: &[&str]) -> Vec<String> {
         keys.iter().map(|s| s.to_string()).collect()
     }
@@ -339,5 +382,90 @@ mod tests {
         let _g = EnvGuard::new(&[("LD_PRELOAD", "evil.so"), ("TERM", "xterm")]);
         let env = build_scrubbed_env(&wl(&["TERM"]));
         assert!(!env.iter().any(|(k, _)| k == "LD_PRELOAD"));
+    }
+
+    fn build_command_with_args(args: Vec<ValidatedArg>) -> ValidatedCommand {
+        let cat_binary =
+            std::fs::canonicalize("/bin/cat").unwrap_or_else(|_| "/usr/bin/cat".into());
+        let cat_binary = check_path(
+            cat_binary.to_str().unwrap(),
+            &ValidationContext::Positional,
+            &[],
+        )
+        .expect("cat binary should validate");
+        ValidatedCommand::new_for_testing(cat_binary, args, IsolationSettings::default(), vec![])
+    }
+
+    #[test]
+    fn test_pin_validated_path_arguments_deduplicates_repeated_paths() {
+        let dir = tempdir().unwrap();
+        let target = dir.path().join("data.txt");
+        std::fs::write(&target, b"SAFE").unwrap();
+
+        let path_arg_1 = check_path(
+            target.to_str().unwrap(),
+            &ValidationContext::Positional,
+            &[],
+        )
+        .unwrap();
+        let path_arg_2 = check_path(
+            target.to_str().unwrap(),
+            &ValidationContext::Positional,
+            &[],
+        )
+        .unwrap();
+        let cmd = build_command_with_args(vec![
+            ValidatedArg::Path(path_arg_1),
+            ValidatedArg::String("--keep".to_string()),
+            ValidatedArg::Path(path_arg_2),
+        ]);
+
+        let mut pinned_paths = Vec::<String>::new();
+        pin_validated_path_arguments_with(&cmd, |_fd, path| {
+            pinned_paths.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(pinned_paths, vec![target.to_string_lossy().to_string()]);
+    }
+
+    #[test]
+    fn test_pin_validated_path_arguments_pins_hardlink_aliases_independently() {
+        let dir = tempdir().unwrap();
+        let path_a = dir.path().join("data.a");
+        let path_b = dir.path().join("data.b");
+        std::fs::write(&path_a, b"SAFE").unwrap();
+        std::fs::hard_link(&path_a, &path_b).unwrap();
+
+        let path_arg_a = check_path(
+            path_a.to_str().unwrap(),
+            &ValidationContext::Positional,
+            &[],
+        )
+        .unwrap();
+        let path_arg_b = check_path(
+            path_b.to_str().unwrap(),
+            &ValidationContext::Positional,
+            &[],
+        )
+        .unwrap();
+        assert_ne!(path_arg_a.path, path_arg_b.path);
+
+        let cmd = build_command_with_args(vec![
+            ValidatedArg::Path(path_arg_a),
+            ValidatedArg::Path(path_arg_b),
+        ]);
+
+        let mut pinned_paths = Vec::<String>::new();
+        pin_validated_path_arguments_with(&cmd, |_fd, path| {
+            pinned_paths.push(path.to_string());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(pinned_paths.len(), 2);
+        assert!(pinned_paths.contains(&path_a.to_string_lossy().to_string()));
+        assert!(pinned_paths.contains(&path_b.to_string_lossy().to_string()));
     }
 }

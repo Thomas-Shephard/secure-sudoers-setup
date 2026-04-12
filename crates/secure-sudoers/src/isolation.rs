@@ -10,6 +10,7 @@ use capabilities::{drop_bounding_capabilities_with, drop_capabilities, parse_cap
 #[cfg(test)]
 use mounts::{
     apply_private_mounts_with, apply_readonly_mounts_with, mount_shadow_fd, mount_shadow_fd_with,
+    pin_validated_path_argument_with,
 };
 #[cfg(test)]
 use nix::mount::{MsFlags, mount};
@@ -32,12 +33,17 @@ pub fn setup_isolation(
     Ok(())
 }
 
+pub(crate) fn pin_validated_path_argument(fd: i32, canonical_path: &str) -> Result<(), Error> {
+    mounts::pin_validated_path_argument(fd, canonical_path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::require_root;
     use crate::testing::in_fork;
-    use secure_sudoers_common::models::IsolationSettings;
+    use secure_sudoers_common::fs::check_path;
+    use secure_sudoers_common::models::{IsolationSettings, ValidationContext};
 
     fn mount_only_settings() -> IsolationSettings {
         IsolationSettings {
@@ -688,6 +694,231 @@ mod tests {
                 || err.to_string().contains("changed after verification")
                 || err.to_string().contains("symlink detected"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_pin_validated_path_argument_rejects_path_swap_before_mount() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target.txt");
+        let moved_path = dir.path().join("target.moved.txt");
+        let attacker_path = dir.path().join("target.attacker.txt");
+        std::fs::write(&base_path, b"ORIGINAL").expect("write base path");
+        std::fs::write(&attacker_path, b"ATTACKER").expect("write attacker path");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let moved_path = moved_path.to_string_lossy().to_string();
+        let attacker_path = attacker_path.to_string_lossy().to_string();
+
+        let fd = safe_traverse(&base_path, false).expect("safe_traverse");
+        let mut calls = 0usize;
+        let result = pin_validated_path_argument_with(
+            fd.as_raw_fd(),
+            &base_path,
+            |path| {
+                assert_eq!(path, base_path.as_str());
+                std::fs::rename(&base_path, &moved_path).map_err(|e| {
+                    secure_sudoers_common::error::Error::IoContext(
+                        "rename base->moved failed".to_string(),
+                        e,
+                    )
+                })?;
+                std::fs::rename(&attacker_path, &base_path).map_err(|e| {
+                    secure_sudoers_common::error::Error::IoContext(
+                        "rename attacker->base failed".to_string(),
+                        e,
+                    )
+                })?;
+                Ok(())
+            },
+            |_source, _target, _fstype, _flags| {
+                calls += 1;
+                Ok::<(), std::io::Error>(())
+            },
+        );
+
+        let err = result.expect_err("path pinning should fail closed after path swap");
+        assert!(
+            err.to_string()
+                .contains("does not match the expected file descriptor")
+                || err
+                    .to_string()
+                    .contains("no longer matches the validated argument")
+                || err.to_string().contains("symlink detected"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(calls, 0, "mount should not be attempted after path swap");
+    }
+
+    #[test]
+    fn test_pin_validated_path_argument_uses_fd_anchored_mount_paths() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target.txt");
+        std::fs::write(&base_path, b"ORIGINAL").expect("write base path");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let fd = safe_traverse(&base_path, false).expect("safe_traverse");
+        let mut call = None::<(Option<String>, String, MsFlags)>;
+
+        pin_validated_path_argument_with(
+            fd.as_raw_fd(),
+            &base_path,
+            |_| Ok(()),
+            |source, target, _fstype, flags| {
+                call = Some((source.map(str::to_owned), target.to_string(), flags));
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .expect("path pinning setup should succeed");
+
+        let (source, target, flags) = call.expect("mount callback should be called");
+        let source = source.expect("bind source should be provided");
+        assert!(
+            source.starts_with("/proc/self/fd/"),
+            "bind source should be fd-anchored, got '{source}'"
+        );
+        assert!(
+            target.starts_with("/proc/self/fd/"),
+            "bind target should be fd-anchored, got '{target}'"
+        );
+        assert_ne!(
+            target, base_path,
+            "bind target should not use the raw path string"
+        );
+        assert_eq!(flags, MsFlags::MS_BIND);
+    }
+
+    #[test]
+    fn test_pin_validated_path_argument_keeps_original_path_stable_after_swap_attempt() {
+        require_root!();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        let owned_dir = format!("{base}/owned");
+        let evil_dir = format!("{base}/evil");
+        std::fs::create_dir(&owned_dir).expect("create owned dir");
+        std::fs::create_dir(&evil_dir).expect("create evil dir");
+        std::fs::write(format!("{owned_dir}/package.deb"), b"SAFE").expect("write safe payload");
+        std::fs::write(format!("{evil_dir}/package.deb"), b"EVIL").expect("write evil payload");
+
+        *GLOBAL_PATH.lock().unwrap() = Some(base.clone());
+
+        fn child_fn() -> bool {
+            let base = {
+                let guard = GLOBAL_PATH.lock().unwrap();
+                guard
+                    .as_ref()
+                    .expect("base path should be configured")
+                    .clone()
+            };
+            let owned_dir = format!("{base}/owned");
+            let owned_backup = format!("{base}/owned.backup");
+            let evil_dir = format!("{base}/evil");
+            let arg_path = format!("{owned_dir}/package.deb");
+
+            if let Err(e) = setup_isolation(&mount_only_settings(), &[]) {
+                eprintln!("setup_isolation failed: {e}");
+                return false;
+            }
+
+            let validated = match check_path(&arg_path, &ValidationContext::Positional, &[]) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("check_path failed: {e}");
+                    return false;
+                }
+            };
+            if let Err(e) = pin_validated_path_argument(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_validated_path_argument failed: {e}");
+                return false;
+            }
+
+            match std::fs::rename(&owned_dir, &owned_backup) {
+                Ok(()) => {
+                    if let Err(e) = std::os::unix::fs::symlink(&evil_dir, &owned_dir) {
+                        eprintln!("symlink swap failed: {e}");
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    if e.raw_os_error() != Some(libc::EBUSY) {
+                        eprintln!("unexpected rename failure after pin mount: {e}");
+                        return false;
+                    }
+                }
+            }
+
+            match std::fs::read_to_string(&arg_path) {
+                Ok(contents) => contents == "SAFE",
+                Err(e) => {
+                    eprintln!("failed reading pinned path: {e}");
+                    false
+                }
+            }
+        }
+
+        let ok = unsafe { in_fork(child_fn) };
+        assert!(
+            ok,
+            "path pinning should keep original argument path bound to validated content"
+        );
+    }
+
+    #[test]
+    fn test_pin_validated_path_argument_mountpoint_is_visible_at_argument_path() {
+        require_root!();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let arg_path = dir.path().join("package.deb");
+        std::fs::write(&arg_path, b"SAFE").expect("write payload");
+        let arg_path = arg_path.to_string_lossy().to_string();
+
+        *GLOBAL_PATH.lock().unwrap() = Some(arg_path.clone());
+
+        fn child_fn() -> bool {
+            let arg_path = {
+                let guard = GLOBAL_PATH.lock().unwrap();
+                guard
+                    .as_ref()
+                    .expect("argument path should be configured")
+                    .clone()
+            };
+
+            if let Err(e) = setup_isolation(&mount_only_settings(), &[]) {
+                eprintln!("setup_isolation failed: {e}");
+                return false;
+            }
+
+            let validated = match check_path(&arg_path, &ValidationContext::Positional, &[]) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("check_path failed: {e}");
+                    return false;
+                }
+            };
+            if let Err(e) = pin_validated_path_argument(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_validated_path_argument failed: {e}");
+                return false;
+            }
+
+            let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("failed to read mountinfo: {e}");
+                    return false;
+                }
+            };
+
+            mountinfo
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(4))
+                .any(|mountpoint| mountpoint == arg_path)
+        }
+
+        let ok = unsafe { in_fork(child_fn) };
+        assert!(
+            ok,
+            "pinning should install a mountpoint at the validated argument path"
         );
     }
 }
