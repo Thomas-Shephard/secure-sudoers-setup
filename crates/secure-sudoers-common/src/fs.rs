@@ -60,7 +60,7 @@ fn resolve_securely(
                 if unsafe { libc::fstat(fd_raw, &mut st) } == 0
                     && (st.st_mode & libc::S_IFMT) == libc::S_IFLNK
                 {
-                    unsafe { libc::close(fd_raw) };
+                    let symlink_fd = unsafe { OwnedFd::from_raw_fd(fd_raw) };
 
                     *symlink_count += 1;
                     if *symlink_count > MAX_SYMLINK_DEPTH {
@@ -69,7 +69,7 @@ fn resolve_securely(
                         ));
                     }
 
-                    let link_target = read_link_at(current_fd.as_raw_fd(), &c_comp)?;
+                    let link_target = read_link_from_fd(symlink_fd.as_raw_fd())?;
                     let link_path = Path::new(&link_target);
 
                     let mut new_path = if link_path.is_absolute() {
@@ -137,21 +137,24 @@ fn open_root() -> Result<OwnedFd, Error> {
     Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
-fn read_link_at(dir_fd: i32, c_name: &std::ffi::CStr) -> Result<String, Error> {
+fn read_link_from_fd(link_fd: i32) -> Result<String, Error> {
     let mut buf = vec![0u8; libc::PATH_MAX as usize];
     let n = unsafe {
         libc::readlinkat(
-            dir_fd,
-            c_name.as_ptr(),
+            link_fd,
+            c"".as_ptr(),
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
         )
     };
     if n < 0 {
         return Err(Error::IoContext(
-            "readlinkat failed".to_string(),
+            "readlinkat on opened symlink failed".to_string(),
             std::io::Error::last_os_error(),
         ));
+    }
+    if n as usize == buf.len() {
+        return Err(Error::Security("Symlink target too long".to_string()));
     }
     let s = std::str::from_utf8(&buf[..n as usize])
         .map_err(|_| Error::Parse("Invalid UTF-8 in symlink".into()))?;
@@ -269,5 +272,34 @@ mod tests {
         let secure = check_path(parent_relative.to_str().unwrap(), &context, &[]).unwrap();
 
         assert_eq!(secure.path, expected);
+    }
+
+    #[test]
+    fn test_read_link_from_fd_is_stable_after_symlink_swap() {
+        use std::os::fd::{AsRawFd, FromRawFd};
+
+        let dir = tempdir().unwrap();
+        let link_path = dir.path().join("link");
+        std::os::unix::fs::symlink("first-target", &link_path).unwrap();
+
+        let c_link = std::ffi::CString::new(link_path.to_str().unwrap()).unwrap();
+        let fd_raw = unsafe {
+            libc::open(
+                c_link.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        assert!(
+            fd_raw >= 0,
+            "failed to open symlink: {}",
+            std::io::Error::last_os_error()
+        );
+        let link_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd_raw) };
+
+        std::fs::remove_file(&link_path).unwrap();
+        std::os::unix::fs::symlink("second-target", &link_path).unwrap();
+
+        let target = read_link_from_fd(link_fd.as_raw_fd()).unwrap();
+        assert_eq!(target, "first-target");
     }
 }
