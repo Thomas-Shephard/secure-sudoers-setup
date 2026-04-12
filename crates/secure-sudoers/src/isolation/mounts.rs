@@ -1,4 +1,7 @@
-use super::path_guard::{ensure_path_matches_fd, fstat_for_fd, proc_fd_path, safe_traverse};
+use super::path_guard::{
+    ensure_path_matches_fd, ensure_path_matches_fd_with_stat, fstat_for_fd, proc_fd_path,
+    safe_traverse,
+};
 use nix::mount::{MsFlags, mount};
 use nix::sched::{CloneFlags, unshare};
 use secure_sudoers_common::error::Error;
@@ -162,8 +165,12 @@ where
     for path_str in paths {
         let fd = safe_traverse(path_str, false)?;
         before_mount(path_str)?;
-        ensure_path_matches_fd(path_str, fd.as_raw_fd())?;
+        // Intentionally re-validate immediately before bind to fail closed on
+        // swaps that can occur after fd capture and before mount syscall.
+        let initial_stat = ensure_path_matches_fd_with_stat(path_str, fd.as_raw_fd())?;
         let mount_source = proc_fd_path(fd.as_raw_fd());
+        // Intentionally self-bind the fd path: this promotes the target to a
+        // mountpoint while keeping both source and target fd-anchored.
         mount_fn(
             Some(mount_source.as_str()),
             mount_source.as_str(),
@@ -171,9 +178,23 @@ where
             MsFlags::MS_BIND,
         )?;
 
+        // Re-open after the bind mount so remount targets the current mountpoint
+        // rather than the pre-bind mount referenced by the original fd.
+        let remount_fd = safe_traverse(path_str, false)?;
+        // Re-validate again to detect swaps between remount_fd acquisition and
+        // remount use, then compare inode/device continuity across phases.
+        let remount_stat = ensure_path_matches_fd_with_stat(path_str, remount_fd.as_raw_fd())?;
+        if initial_stat.st_dev != remount_stat.st_dev || initial_stat.st_ino != remount_stat.st_ino
+        {
+            return Err(Error::Security(format!(
+                "Security failure: path '{}' changed between bind and remount",
+                path_str
+            )));
+        }
+        let remount_target = proc_fd_path(remount_fd.as_raw_fd());
         mount_fn(
-            Some(mount_source.as_str()),
-            mount_source.as_str(),
+            None::<&str>,
+            remount_target.as_str(),
             None,
             MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
         )?;

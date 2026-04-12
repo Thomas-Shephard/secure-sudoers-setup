@@ -18,17 +18,26 @@ pub(super) fn fstat_for_fd(fd: i32, context_path: &str) -> Result<libc::stat, Er
 }
 
 pub(super) fn ensure_path_matches_fd(path_str: &str, expected_fd: i32) -> Result<(), Error> {
+    ensure_path_matches_fd_with_stat(path_str, expected_fd).map(|_| ())
+}
+
+pub(super) fn ensure_path_matches_fd_with_stat(
+    path_str: &str,
+    expected_fd: i32,
+) -> Result<libc::stat, Error> {
+    // Intentionally re-traverse here to catch path swaps that may occur
+    // after the caller captured expected_fd but before the sensitive use.
     let current_fd = safe_traverse(path_str, false)?;
     let expected = fstat_for_fd(expected_fd, path_str)?;
     let current = fstat_for_fd(current_fd.as_raw_fd(), path_str)?;
 
     if expected.st_dev != current.st_dev || expected.st_ino != current.st_ino {
         return Err(Error::Security(format!(
-            "Security failure: path '{}' changed after verification",
+            "Security failure: path '{}' does not match the expected file descriptor",
             path_str
         )));
     }
-    Ok(())
+    Ok(expected)
 }
 
 pub(super) fn safe_traverse(path_str: &str, create: bool) -> Result<std::os::fd::OwnedFd, Error> {

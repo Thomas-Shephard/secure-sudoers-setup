@@ -315,6 +315,8 @@ mod tests {
             match ensure_path_matches_fd(&target_path, fd.as_raw_fd()) {
                 Err(e)
                     if e.to_string().contains("symlink detected")
+                        || e.to_string()
+                            .contains("does not match the expected file descriptor")
                         || e.to_string().contains("changed after verification") =>
                 {
                     true
@@ -376,7 +378,9 @@ mod tests {
 
         let err = result.expect_err("private mount should fail closed after path swap");
         assert!(
-            err.to_string().contains("changed after verification")
+            err.to_string()
+                .contains("does not match the expected file descriptor")
+                || err.to_string().contains("changed after verification")
                 || err.to_string().contains("symlink detected"),
             "unexpected error: {err}"
         );
@@ -458,7 +462,9 @@ mod tests {
 
         let err = result.expect_err("readonly mount should fail closed after path swap");
         assert!(
-            err.to_string().contains("changed after verification")
+            err.to_string()
+                .contains("does not match the expected file descriptor")
+                || err.to_string().contains("changed after verification")
                 || err.to_string().contains("symlink detected"),
             "unexpected error: {err}"
         );
@@ -486,30 +492,97 @@ mod tests {
         .expect("readonly mount setup should succeed");
 
         assert_eq!(calls.len(), 2, "readonly setup should issue bind + remount");
-        for (source, target, _flags) in &calls {
-            let source = source.as_deref().expect("source should be provided");
-            assert!(
-                source.starts_with("/proc/self/fd/"),
-                "readonly mount source should be fd-anchored, got '{source}'"
-            );
-            assert!(
-                target.starts_with("/proc/self/fd/"),
-                "readonly mount target should be fd-anchored, got '{target}'"
-            );
-            assert_eq!(
-                source, target,
-                "readonly mount source/target should anchor to the same fd path"
-            );
-            assert_ne!(
-                target, &base_path,
-                "readonly mount target should not use the raw path string"
-            );
-        }
+        let bind_source = calls[0]
+            .0
+            .as_deref()
+            .expect("bind source should be provided");
+        assert!(
+            bind_source.starts_with("/proc/self/fd/"),
+            "bind source should be fd-anchored, got '{bind_source}'"
+        );
+        assert!(
+            calls[0].1.starts_with("/proc/self/fd/"),
+            "bind target should be fd-anchored, got '{}'",
+            calls[0].1
+        );
+        assert_eq!(
+            bind_source, calls[0].1,
+            "bind source/target should anchor to the same fd path"
+        );
+        assert_ne!(
+            &calls[0].1, &base_path,
+            "bind target should not use the raw path string"
+        );
+
+        assert!(
+            calls[1].0.is_none(),
+            "remount should not require a source path"
+        );
+        assert!(
+            calls[1].1.starts_with("/proc/self/fd/"),
+            "remount target should be fd-anchored, got '{}'",
+            calls[1].1
+        );
+        assert_ne!(
+            &calls[1].1, &base_path,
+            "remount target should not use the raw path string"
+        );
+        assert_ne!(
+            calls[0].1, calls[1].1,
+            "remount should use a refreshed fd path after bind"
+        );
         assert_eq!(calls[0].2, MsFlags::MS_BIND);
         assert_eq!(
             calls[1].2,
             MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY
         );
+    }
+
+    #[test]
+    fn test_apply_readonly_mounts_rejects_path_swap_between_bind_and_remount() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target");
+        let moved_path = dir.path().join("target.moved");
+        let attacker_path = dir.path().join("target.attacker");
+        std::fs::create_dir(&base_path).expect("create base dir");
+        std::fs::create_dir(&attacker_path).expect("create attacker dir");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let moved_path = moved_path.to_string_lossy().to_string();
+        let attacker_path = attacker_path.to_string_lossy().to_string();
+        let paths = vec![base_path.clone()];
+        let mut calls = 0usize;
+
+        let result = apply_readonly_mounts_with(
+            &paths,
+            |_| Ok(()),
+            |_source, _target, _fstype, _flags| {
+                calls += 1;
+                if calls == 1 {
+                    std::fs::rename(&base_path, &moved_path).map_err(|e| {
+                        secure_sudoers_common::error::Error::IoContext(
+                            "rename base->moved failed".to_string(),
+                            e,
+                        )
+                    })?;
+                    std::fs::rename(&attacker_path, &base_path).map_err(|e| {
+                        secure_sudoers_common::error::Error::IoContext(
+                            "rename attacker->base failed".to_string(),
+                            e,
+                        )
+                    })?;
+                }
+                Ok(())
+            },
+        );
+
+        let err =
+            result.expect_err("readonly mount should fail closed after bind/remount path swap");
+        assert!(
+            err.to_string().contains("changed between bind and remount"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(calls, 1, "remount should not be attempted after path swap");
     }
 
     #[test]
@@ -610,7 +683,9 @@ mod tests {
         let err = mount_shadow_fd(fd.as_raw_fd(), &base_path)
             .expect_err("mount_shadow_fd should fail closed after path swap");
         assert!(
-            err.to_string().contains("changed after verification")
+            err.to_string()
+                .contains("does not match the expected file descriptor")
+                || err.to_string().contains("changed after verification")
                 || err.to_string().contains("symlink detected"),
             "unexpected error: {err}"
         );
