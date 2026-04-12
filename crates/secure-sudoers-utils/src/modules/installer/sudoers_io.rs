@@ -1,4 +1,5 @@
 use super::config::ENTRY_POINT_DIR;
+use crate::modules::path_security::{proc_fd_directory_path, secure_parent_directory};
 use secure_sudoers_common::error::Error;
 
 pub fn generate_sudoers_content(tools: &[String]) -> String {
@@ -29,6 +30,7 @@ pub(super) fn write_sudoers_file_to(
     entry_point_dir: &str,
 ) -> Result<(), Error> {
     use std::io::Write;
+    use std::os::fd::AsRawFd;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     struct TempFileCleanupGuard {
@@ -66,12 +68,23 @@ pub(super) fn write_sudoers_file_to(
 
     let content = generate_sudoers_content_with_dir(tools, entry_point_dir);
     let sudoers = std::path::Path::new(sudoers_path);
+    let secure_parent = secure_parent_directory(sudoers, "sudoers destination parent directory")?;
+    let anchored_parent = proc_fd_directory_path(&secure_parent);
     let sudoers_file_name = sudoers.file_name().ok_or_else(|| {
         Error::System(format!(
             "Invalid sudoers destination path {sudoers_path}: missing file name"
         ))
     })?;
-    let temp_path = sudoers.with_file_name(format!("{}.tmp", sudoers_file_name.to_string_lossy()));
+    let temp_file_name = format!("{}.tmp", sudoers_file_name.to_string_lossy());
+    let temp_path_visible = sudoers.with_file_name(&temp_file_name);
+    let temp_path = anchored_parent.join(&temp_file_name);
+    let visudo_temp_path = std::path::PathBuf::from(format!(
+        "/proc/{}/fd/{}/{}",
+        std::process::id(),
+        secure_parent.fd.as_raw_fd(),
+        temp_file_name
+    ));
+    let sudoers_target = anchored_parent.join(sudoers_file_name);
     let mut temp_cleanup_guard = TempFileCleanupGuard::new(temp_path.clone());
 
     let mut f = std::fs::OpenOptions::new()
@@ -84,7 +97,7 @@ pub(super) fn write_sudoers_file_to(
             Error::IoContext(
                 format!(
                     "Cannot create temporary sudoers file {} for destination {}",
-                    temp_path.display(),
+                    temp_path_visible.display(),
                     sudoers_path
                 ),
                 e,
@@ -95,7 +108,7 @@ pub(super) fn write_sudoers_file_to(
             Error::IoContext(
                 format!(
                     "Cannot set permissions on temporary sudoers file {}",
-                    temp_path.display()
+                    temp_path_visible.display()
                 ),
                 e,
             )
@@ -104,7 +117,7 @@ pub(super) fn write_sudoers_file_to(
         Error::IoContext(
             format!(
                 "Cannot write temporary sudoers file {} for destination {}",
-                temp_path.display(),
+                temp_path_visible.display(),
                 sudoers_path
             ),
             e,
@@ -114,7 +127,7 @@ pub(super) fn write_sudoers_file_to(
         Error::IoContext(
             format!(
                 "Cannot flush temporary sudoers file {} for destination {}",
-                temp_path.display(),
+                temp_path_visible.display(),
                 sudoers_path
             ),
             e,
@@ -129,7 +142,7 @@ pub(super) fn write_sudoers_file_to(
         match std::process::Command::new(visudo_path)
             .arg("-c")
             .arg("-f")
-            .arg(&temp_path)
+            .arg(&visudo_temp_path)
             .output()
         {
             Ok(output) => {
@@ -146,32 +159,32 @@ pub(super) fn write_sudoers_file_to(
                 "Cannot execute visudo from known paths (/usr/sbin/visudo, /usr/bin/visudo) \
 while validating sudoers destination {} for temporary file {}: command not found",
                 sudoers_path,
-                temp_path.display()
+                temp_path_visible.display()
             ))
         } else {
             Error::System(format!(
                 "Cannot execute visudo from known paths (/usr/sbin/visudo, /usr/bin/visudo) \
 while validating sudoers destination {} for temporary file {}: {}",
                 sudoers_path,
-                temp_path.display(),
+                temp_path_visible.display(),
                 visudo_exec_errors.join("; ")
             ))
         }
     })?;
     if !visudo_output.status.success() {
         return Err(Error::Validation(visudo_validation_failed_message(
-            &temp_path,
+            &temp_path_visible,
             sudoers_path,
             &visudo_output,
         )));
     }
 
-    std::fs::rename(&temp_path, sudoers).map_err(|e| {
+    std::fs::rename(&temp_path, &sudoers_target).map_err(|e| {
         Error::IoContext(
             format!(
                 "Cannot atomically replace sudoers destination {} with temporary file {}",
                 sudoers_path,
-                temp_path.display()
+                temp_path_visible.display()
             ),
             e,
         )

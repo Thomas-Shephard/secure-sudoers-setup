@@ -1,4 +1,5 @@
 use super::keys::load_verifying_key;
+use crate::modules::path_security::{proc_fd_directory_path, secure_parent_directory};
 use ed25519_dalek::{Signature, Verifier};
 use secure_sudoers_common::error::Error;
 use secure_sudoers_common::models::SecureSudoersPolicy;
@@ -116,25 +117,35 @@ fn sanitize_url_for_logs_from_str(url: &str) -> String {
 }
 
 fn install_update(policy_path: &str, policy_bytes: &[u8], sig_bytes: &[u8]) -> Result<(), Error> {
-    let policy_dir = Path::new(policy_path)
-        .parent()
-        .unwrap_or_else(|| Path::new("/etc/secure-sudoers"));
+    let policy_ref = Path::new(policy_path);
+    let secure_policy_parent = secure_parent_directory(
+        Path::new(policy_path),
+        "policy destination parent directory",
+    )?;
+    let policy_file_name = policy_ref.file_name().ok_or_else(|| {
+        Error::System(format!(
+            "Invalid policy destination path {policy_path}: missing file name"
+        ))
+    })?;
+    let anchored_parent_dir = proc_fd_directory_path(&secure_policy_parent);
+    let policy_target_path = anchored_parent_dir.join(policy_file_name);
+    let sig_target_path =
+        anchored_parent_dir.join(format!("{}.sig", policy_file_name.to_string_lossy()));
     let sig_path = format!("{policy_path}.sig");
-    let sig_path_ref = Path::new(&sig_path);
-    let previous_sig = read_existing_signature_for_rollback(sig_path_ref).map_err(|e| {
+    let previous_sig = read_existing_signature_for_rollback(&sig_target_path).map_err(|e| {
         Error::IoContext(
             format!("Failed to read existing signature at {sig_path}"),
             e,
         )
     })?;
-    let sig_mode = read_existing_mode(sig_path_ref)
+    let sig_mode = read_existing_mode(&sig_target_path)
         .map_err(|e| Error::IoContext(format!("Cannot read metadata for {sig_path}"), e))?;
-    let sig_was_immutable = read_existing_immutable(sig_path_ref)
+    let sig_was_immutable = read_existing_immutable(&sig_target_path)
         .map_err(|e| Error::IoContext(format!("Cannot inspect immutable flag for {sig_path}"), e))?
         .unwrap_or(false);
-    let policy_mode = read_existing_mode(Path::new(policy_path))
+    let policy_mode = read_existing_mode(&policy_target_path)
         .map_err(|e| Error::IoContext(format!("Cannot read metadata for {policy_path}"), e))?;
-    let policy_was_immutable = read_existing_immutable(Path::new(policy_path))
+    let policy_was_immutable = read_existing_immutable(&policy_target_path)
         .map_err(|e| {
             Error::IoContext(
                 format!("Cannot inspect immutable flag for {policy_path}"),
@@ -143,9 +154,12 @@ fn install_update(policy_path: &str, policy_bytes: &[u8], sig_bytes: &[u8]) -> R
         })?
         .unwrap_or(false);
 
-    let mut tmp_sig = tempfile::NamedTempFile::new_in(policy_dir).map_err(|e| {
+    let mut tmp_sig = tempfile::NamedTempFile::new_in(&anchored_parent_dir).map_err(|e| {
         Error::IoContext(
-            format!("Cannot create temp sig file in {}", policy_dir.display()),
+            format!(
+                "Cannot create temp sig file in {}",
+                anchored_parent_dir.display()
+            ),
             e,
         )
     })?;
@@ -160,9 +174,12 @@ fn install_update(policy_path: &str, policy_bytes: &[u8], sig_bytes: &[u8]) -> R
         |e| Error::IoContext("Failed to set permissions on temp sig file".to_string(), e),
     )?;
 
-    let mut tmp_policy = tempfile::NamedTempFile::new_in(policy_dir).map_err(|e| {
+    let mut tmp_policy = tempfile::NamedTempFile::new_in(&anchored_parent_dir).map_err(|e| {
         Error::IoContext(
-            format!("Cannot create temp policy file in {}", policy_dir.display()),
+            format!(
+                "Cannot create temp policy file in {}",
+                anchored_parent_dir.display()
+            ),
             e,
         )
     })?;
@@ -185,7 +202,7 @@ fn install_update(policy_path: &str, policy_bytes: &[u8], sig_bytes: &[u8]) -> R
     })?;
 
     tmp_sig
-        .persist(&sig_path)
+        .persist(&sig_target_path)
         .map_err(|e| Error::IoContext("Atomic rename of signature failed".to_string(), e.error))?;
 
     run_with_signature_rollback(
@@ -194,7 +211,7 @@ fn install_update(policy_path: &str, policy_bytes: &[u8], sig_bytes: &[u8]) -> R
         sig_mode,
         sig_was_immutable,
         move || {
-            tmp_policy.persist(policy_path).map_err(|e| {
+            tmp_policy.persist(&policy_target_path).map_err(|e| {
                 Error::IoContext("Atomic rename of policy failed".to_string(), e.error)
             })?;
             Ok(())
@@ -240,8 +257,13 @@ where
 
 fn read_existing_signature_for_rollback(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
     use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let file = match std::fs::File::open(path) {
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
@@ -322,8 +344,17 @@ fn restore_immutable_if_needed(
 }
 
 fn read_existing_mode(path: &Path) -> std::io::Result<Option<u32>> {
-    match std::fs::metadata(path) {
-        Ok(metadata) => Ok(Some(metadata.permissions().mode() & 0o777)),
+    use std::os::unix::fs::OpenOptionsExt;
+
+    match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)
+    {
+        Ok(file) => {
+            let metadata = file.metadata()?;
+            Ok(Some(metadata.permissions().mode() & 0o777))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
@@ -342,18 +373,29 @@ fn restore_signature(
     previous_sig_mode: Option<u32>,
     previous_sig_was_immutable: bool,
 ) -> std::io::Result<()> {
+    let sig_ref = Path::new(sig_path);
+    let secure_sig_parent =
+        secure_parent_directory(sig_ref, "signature destination parent directory")
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let sig_file_name = sig_ref.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Invalid signature destination path {sig_path}: missing file name"),
+        )
+    })?;
+    let anchored_parent_dir = proc_fd_directory_path(&secure_sig_parent);
+    let anchored_sig_path = anchored_parent_dir.join(sig_file_name);
+
     match previous_sig {
         Some(bytes) => {
-            let path = Path::new(sig_path);
-            let dir = path.parent().unwrap_or_else(|| Path::new("."));
-            let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+            let mut tmp = tempfile::NamedTempFile::new_in(&anchored_parent_dir)?;
             tmp.write_all(bytes)?;
             apply_mode_if_present(
                 tmp.as_file(),
                 previous_sig_mode.or(Some(DEFAULT_POLICY_MODE)),
             )?;
             tmp.as_file().sync_all()?;
-            tmp.persist(sig_path).map_err(|e| e.error)?;
+            tmp.persist(&anchored_sig_path).map_err(|e| e.error)?;
             if previous_sig_was_immutable {
                 let errors = super::installer::immutable::chattr_op("+i", &[sig_path]);
                 if !errors.is_empty() {
@@ -365,7 +407,7 @@ fn restore_signature(
             }
             Ok(())
         }
-        None => match std::fs::remove_file(sig_path) {
+        None => match std::fs::remove_file(&anchored_sig_path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e),
@@ -1174,6 +1216,40 @@ mod tests {
         assert!(
             !sig_path.exists(),
             "signature should be removed when no prior signature exists"
+        );
+    }
+
+    #[test]
+    fn read_existing_mode_rejects_symlink_path() {
+        let temp = TempDir::new().expect("test tempdir should be created");
+        let target = temp.path().join("policy.real");
+        let link = temp.path().join("policy.link");
+        std::fs::write(&target, b"{}").expect("target file should be writable");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let err =
+            read_existing_mode(&link).expect_err("symlink metadata lookup should be rejected");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn read_existing_signature_for_rollback_rejects_symlink_path() {
+        let temp = TempDir::new().expect("test tempdir should be created");
+        let target = temp.path().join("policy.sig.real");
+        let link = temp.path().join("policy.sig.link");
+        std::fs::write(&target, vec![0u8; 64]).expect("target signature should be writable");
+        std::os::unix::fs::symlink(&target, &link).expect("symlink should be created");
+
+        let err = read_existing_signature_for_rollback(&link)
+            .expect_err("symlink signature lookup should be rejected");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(libc::ELOOP),
+            "unexpected error: {err}"
         );
     }
 }

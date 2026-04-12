@@ -285,6 +285,27 @@ mod tests {
     }
 
     #[test]
+    fn test_install_tool_links_rejects_symlink_binary_path() {
+        let dir = TempDir::new().unwrap();
+        let real_binary = dir.path().join("secure-sudoers.real");
+        std::fs::write(&real_binary, b"binary").unwrap();
+        let managed_binary = dir.path().join("secure-sudoers");
+        std::os::unix::fs::symlink(&real_binary, &managed_binary).unwrap();
+
+        let (ok, errs) = install_tool_links_to(
+            &["mytool".to_string()],
+            managed_binary.to_str().unwrap(),
+            dir.path().to_str().unwrap(),
+        );
+        assert!(ok.is_empty());
+        assert!(!errs.is_empty());
+        assert!(
+            errs[0].contains("not a regular file"),
+            "unexpected errors: {errs:?}"
+        );
+    }
+
+    #[test]
     fn test_write_sudoers_file_to_creates_correct_content() {
         let dir = TempDir::new().unwrap();
         let sudoers = dir.path().join("sudoers");
@@ -319,6 +340,25 @@ mod tests {
         assert!(
             !dir.path().join("sudoers.tmp").exists(),
             "temporary file should be removed after validation failure"
+        );
+    }
+
+    #[test]
+    fn test_write_sudoers_file_to_rejects_non_directory_parent() {
+        let dir = TempDir::new().unwrap();
+        let not_a_dir = dir.path().join("not-a-directory");
+        std::fs::write(&not_a_dir, b"not-a-directory").unwrap();
+        let sudoers = not_a_dir.join("secure-sudoers");
+
+        let err = write_sudoers_file_to(
+            &["apt".to_string()],
+            sudoers.to_str().unwrap(),
+            "/usr/local/bin",
+        )
+        .expect_err("sudoers parent path must be a directory");
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "unexpected error: {err}"
         );
     }
 

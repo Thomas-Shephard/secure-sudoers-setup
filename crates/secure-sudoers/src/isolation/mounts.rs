@@ -39,7 +39,7 @@ where
                     "Security failure: tmpfs mount on blocked dir '{}' failed",
                     original_path
                 ),
-                IoError::from(e),
+                e,
             )
         })?;
     } else {
@@ -55,7 +55,7 @@ where
                     "Security failure: bind mount /dev/null on blocked file '{}' failed",
                     original_path
                 ),
-                IoError::from(e),
+                e,
             )
         })?;
     }
