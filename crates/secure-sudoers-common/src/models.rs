@@ -2,6 +2,7 @@ use crate::error::Error;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::OnceLock;
 
 pub struct SecurePath {
@@ -461,25 +462,32 @@ impl SecureSudoersPolicy {
 
         for (name, tool) in &self.tools {
             let path = std::path::Path::new(&tool.real_binary);
-            if !path.exists() {
-                results.push(format!(
-                    "Tool '{}': real_binary '{}' does not exist on the filesystem",
-                    name, tool.real_binary
-                ));
-            } else if !path.is_file() {
-                results.push(format!(
-                    "Tool '{}': real_binary '{}' exists but is not a file",
-                    name, tool.real_binary
-                ));
-            } else {
-                use std::os::unix::fs::PermissionsExt;
-                if let Ok(metadata) = path.metadata()
-                    && metadata.permissions().mode() & 0o111 == 0
-                {
+            match std::fs::metadata(path) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                     results.push(format!(
-                        "Tool '{}': real_binary '{}' exists but is not executable",
+                        "Tool '{}': real_binary '{}' does not exist on the filesystem",
                         name, tool.real_binary
                     ));
+                }
+                Err(e) => {
+                    results.push(format!(
+                        "Tool '{}': cannot inspect real_binary '{}': {}",
+                        name, tool.real_binary, e
+                    ));
+                }
+                Ok(metadata) if !metadata.is_file() => {
+                    results.push(format!(
+                        "Tool '{}': real_binary '{}' exists but is not a file",
+                        name, tool.real_binary
+                    ));
+                }
+                Ok(metadata) => {
+                    if metadata.permissions().mode() & 0o111 == 0 {
+                        results.push(format!(
+                            "Tool '{}': real_binary '{}' exists but is not executable",
+                            name, tool.real_binary
+                        ));
+                    }
                 }
             }
         }
@@ -491,6 +499,7 @@ impl SecureSudoersPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     #[test]
     fn test_unknown_field_in_policy_rejected() {
@@ -836,5 +845,48 @@ mod tests {
         assert!(config.matches_allowed_or_regex("prod"));
         assert!(config.matches_allowed_or_regex("staging"));
         assert!(!config.matches_allowed_or_regex("dev"));
+    }
+
+    #[test]
+    fn test_policy_lint_reports_missing_binary_with_single_metadata_pass() {
+        let mut policy = make_valid_policy();
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+
+        policy
+            .tools
+            .insert("missing".to_string(), make_tool(missing.to_str().unwrap()));
+
+        let issues = policy.lint();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("does not exist on the filesystem")),
+            "unexpected lint output: {issues:?}"
+        );
+    }
+
+    #[test]
+    fn test_policy_lint_reports_non_executable_binary_with_single_metadata_pass() {
+        let mut policy = make_valid_policy();
+        let tmp = tempfile::tempdir().unwrap();
+        let binary_path = tmp.path().join("tool.sh");
+
+        std::fs::write(&binary_path, "#!/bin/sh\necho hi\n").unwrap();
+        let mut perms = std::fs::metadata(&binary_path).unwrap().permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&binary_path, perms).unwrap();
+
+        policy
+            .tools
+            .insert("tool".to_string(), make_tool(binary_path.to_str().unwrap()));
+
+        let issues = policy.lint();
+        assert!(
+            issues
+                .iter()
+                .any(|issue| issue.contains("exists but is not executable")),
+            "unexpected lint output: {issues:?}"
+        );
     }
 }
