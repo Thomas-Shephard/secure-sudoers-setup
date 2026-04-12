@@ -76,6 +76,28 @@ mod tests {
     use std::sync::Mutex;
     static GLOBAL_PATH: Mutex<Option<String>> = Mutex::new(None);
 
+    struct MountCleanupGuard {
+        mountpoint: std::ffi::CString,
+    }
+
+    impl MountCleanupGuard {
+        fn new(mountpoint: &std::path::Path) -> Self {
+            let mountpoint = std::ffi::CString::new(
+                mountpoint
+                    .to_str()
+                    .expect("mount target path should be valid UTF-8"),
+            )
+            .expect("mount target path should not contain NUL");
+            Self { mountpoint }
+        }
+    }
+
+    impl Drop for MountCleanupGuard {
+        fn drop(&mut self) {
+            let _ = unsafe { libc::umount2(self.mountpoint.as_ptr(), libc::MNT_DETACH) };
+        }
+    }
+
     fn pin_parent_chain_for_path(canonical_path: &str) -> Result<(), Error> {
         if canonical_path == "/" {
             return Ok(());
@@ -893,6 +915,84 @@ mod tests {
             "root path pinning should target the canonical root path"
         );
         assert_eq!(*flags, MsFlags::MS_BIND);
+    }
+
+    #[test]
+    fn test_pin_path_at_fd_handles_bind_mounted_file_path() {
+        require_root!();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let source_path = dir.path().join("source.txt");
+        let mounted_path = dir.path().join("mounted.txt");
+        std::fs::write(&source_path, b"SAFE").expect("write source file");
+        std::fs::write(&mounted_path, b"PLACEHOLDER").expect("write mount target file");
+
+        mount(
+            Some(
+                source_path
+                    .to_str()
+                    .expect("source path should be valid UTF-8"),
+            ),
+            mounted_path
+                .to_str()
+                .expect("mount target path should be valid UTF-8"),
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .expect("bind mount test file");
+        let _mount_cleanup = MountCleanupGuard::new(&mounted_path);
+
+        let base = dir.path().to_string_lossy().to_string();
+        *GLOBAL_PATH.lock().unwrap() = Some(base.clone());
+
+        fn child_fn() -> bool {
+            let base = {
+                let guard = GLOBAL_PATH.lock().unwrap();
+                guard
+                    .as_ref()
+                    .expect("base path should be configured")
+                    .clone()
+            };
+            let mounted_path = format!("{base}/mounted.txt");
+
+            if let Err(e) = setup_isolation(&mount_only_settings(), &[]) {
+                eprintln!("setup_isolation failed: {e}");
+                return false;
+            }
+
+            let validated = match check_path(&mounted_path, &ValidationContext::Positional, &[]) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("check_path failed: {e}");
+                    return false;
+                }
+            };
+
+            if let Err(e) = pin_parent_chain_for_path(&validated.path) {
+                eprintln!("pin_parent_chain_for_path failed: {e}");
+                return false;
+            }
+            if let Err(e) = pin_path_at_fd(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_path_at_fd failed: {e}");
+                return false;
+            }
+
+            match std::fs::read_to_string(&validated.path) {
+                Ok(contents) => contents == "SAFE",
+                Err(e) => {
+                    eprintln!("failed reading pinned path: {e}");
+                    false
+                }
+            }
+        }
+
+        let ok = unsafe { in_fork(child_fn) };
+
+        assert!(
+            ok,
+            "pinning should succeed for already bind-mounted file paths"
+        );
     }
 
     #[test]
