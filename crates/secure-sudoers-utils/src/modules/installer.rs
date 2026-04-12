@@ -15,8 +15,6 @@ use sudoers_io::write_sudoers_file_to;
 use targets::{discover_managed_tools, managed_targets};
 
 #[cfg(test)]
-use immutable::{find_first_existing_path, should_skip_chattr_target};
-#[cfg(test)]
 use sudoers_io::{generate_sudoers_content, generate_sudoers_content_with_dir};
 #[cfg(test)]
 use targets::file_identity;
@@ -496,56 +494,6 @@ mod tests {
             entry_point_dir.to_str().expect("utf-8 entry-point dir"),
         );
         assert!(tools.is_empty(), "unrelated files must not be discovered");
-    }
-
-    #[test]
-    fn test_find_first_existing_path_returns_first_match() {
-        let dir = TempDir::new().unwrap();
-        let existing = dir.path().join("candidate");
-        std::fs::write(&existing, b"x").unwrap();
-        let existing_path = existing.to_str().unwrap();
-        let candidates = ["/definitely/not/present", existing_path];
-        assert_eq!(find_first_existing_path(&candidates), Some(existing_path));
-    }
-
-    #[test]
-    fn test_find_first_existing_path_returns_none_when_missing() {
-        let candidates = ["/definitely/not/present", "/also/not/present"];
-        assert_eq!(find_first_existing_path(&candidates), None);
-    }
-
-    #[test]
-    fn test_should_skip_chattr_target_false_for_symlink() {
-        let dir = TempDir::new().unwrap();
-        let target = dir.path().join("target");
-        std::fs::write(&target, b"t").unwrap();
-        let link = dir.path().join("tool");
-        std::os::unix::fs::symlink(&target, &link).unwrap();
-
-        assert!(!should_skip_chattr_target("+i", link.to_str().unwrap()).unwrap());
-    }
-
-    #[test]
-    fn test_should_skip_chattr_target_false_for_regular_file() {
-        let dir = TempDir::new().unwrap();
-        let file = dir.path().join("regular");
-        std::fs::write(&file, b"r").unwrap();
-
-        assert!(!should_skip_chattr_target("+i", file.to_str().unwrap()).unwrap());
-    }
-
-    #[test]
-    fn test_should_skip_chattr_target_true_for_missing_on_unlock() {
-        let dir = TempDir::new().unwrap();
-        let missing = dir.path().join("missing");
-        assert!(should_skip_chattr_target("-i", missing.to_str().unwrap()).unwrap());
-    }
-
-    #[test]
-    fn test_should_skip_chattr_target_false_for_missing_on_install() {
-        let dir = TempDir::new().unwrap();
-        let missing = dir.path().join("missing");
-        assert!(!should_skip_chattr_target("+i", missing.to_str().unwrap()).unwrap());
     }
 
     #[test]

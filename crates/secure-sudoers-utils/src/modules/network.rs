@@ -278,7 +278,7 @@ fn read_existing_immutable(path: &Path) -> std::io::Result<Option<bool>> {
     };
 
     let mut flags: libc::c_int = 0;
-    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS as _, &mut flags) };
+    let rc = unsafe { libc::ioctl(file.as_raw_fd(), libc::FS_IOC_GETFLAGS, &mut flags) };
     if rc == 0 {
         return Ok(Some((flags & LINUX_FS_IMMUTABLE_FL) != 0));
     }

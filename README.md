@@ -8,7 +8,7 @@ The tool is intended to replace traditional access to sudo by enforcing the **pr
 - **Argument-Level Control**: Validate flags, positional arguments, and file paths using regex or fixed choices.
 - **Cryptographic Security**: Policies are signed with Ed25519; unauthorized or modified policies are rejected.
 - **Process Isolation**: Secure sandboxing with network, PID, and mount namespaces (optional per tool).
-- **Tamper Resistance**: Automatically applies the immutable bit (`chattr +i`) to configuration and binaries.
+- **Tamper Resistance**: Automatically applies the immutable bit (equivalent to `chattr +i`) to configuration and binaries.
 - **Auto Sudo Configuration**: Generates a single `sudoers.d` drop-in to manage all delegated tools.
 - **Security Telemetry**: Every command attempt emits a structured JSON security event to `LOG_AUTHPRIV`, providing immutable audit trails.
 
@@ -22,7 +22,6 @@ The tool is intended to replace traditional access to sudo by enforcing the **pr
 ## System Requirements
 - **Linux kernel**: **4.19 or newer** (enforced at runtime by `secure-sudoers` and `secure-sudoers-utils`).
 - **Privileges**: Root is required for `install`, `unlock`, and `update`.
-- **Tools**: `chattr` (for immutable hardening).
 
 Optional namespace smoke test with bubblewrap:
 ```bash
@@ -75,7 +74,7 @@ This command performs the following actions:
 - Verifies `policy.json.sig` against `/etc/secure-sudoers/secure_sudoers_public_key.pem` before applying any changes.
 - Creates hard-link tool entry points in `/usr/local/bin` for every tool defined in your policy.
 - Writes a secure sudoers drop-in to `/etc/sudoers.d/secure-sudoers`.
-- Protects the binaries, policy JSON, policy signature, trusted public key, sudoers drop-in, and hard-link tool entry points with the immutable bit (`chattr +i`).
+- Protects the binaries, policy JSON, policy signature, trusted public key, sudoers drop-in, and hard-link tool entry points with the immutable bit (equivalent to `chattr +i`).
 - Returns an error if immutable hardening cannot be applied to all managed files.
 - May leave partial changes when an installation error occurs; run `unlock`, correct the issue, and re-run `install`.
 
