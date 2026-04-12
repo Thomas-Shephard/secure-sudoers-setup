@@ -7,18 +7,31 @@ use std::io::Error as IoError;
 use std::os::fd::AsRawFd;
 
 pub(super) fn mount_shadow_fd(fd: i32, original_path: &str) -> Result<(), Error> {
+    mount_shadow_fd_with(fd, original_path, |source, target, fstype, flags| {
+        mount(source, target, fstype, flags, None::<&str>).map_err(IoError::from)
+    })
+}
+
+pub(super) fn mount_shadow_fd_with<MountFn>(
+    fd: i32,
+    original_path: &str,
+    mut mount_fn: MountFn,
+) -> Result<(), Error>
+where
+    MountFn: FnMut(Option<&str>, &str, Option<&str>, MsFlags) -> Result<(), IoError>,
+{
     let st = fstat_for_fd(fd, original_path)?;
     // Re-verify the path binding immediately before mount to fail closed on path-swap races.
     ensure_path_matches_fd(original_path, fd)?;
+    let mount_target = proc_fd_path(fd);
     let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
 
     if is_dir {
-        mount(
+        mount_fn(
             Some("tmpfs"),
-            original_path,
+            mount_target.as_str(),
             Some("tmpfs"),
             MsFlags::empty(),
-            None::<&str>,
         )
         .map_err(|e| {
             Error::IoContext(
@@ -30,12 +43,11 @@ pub(super) fn mount_shadow_fd(fd: i32, original_path: &str) -> Result<(), Error>
             )
         })?;
     } else {
-        mount(
+        mount_fn(
             Some("/dev/null"),
-            original_path,
+            mount_target.as_str(),
             None::<&str>,
             MsFlags::MS_BIND,
-            None::<&str>,
         )
         .map_err(|e| {
             Error::IoContext(
@@ -116,9 +128,10 @@ where
         let fd = safe_traverse(path_str, false)?;
         before_mount(path_str)?;
         ensure_path_matches_fd(path_str, fd.as_raw_fd())?;
+        let mount_target = proc_fd_path(fd.as_raw_fd());
         mount_fn(
             Some("tmpfs"),
-            path_str.as_str(),
+            mount_target.as_str(),
             Some("tmpfs"),
             MsFlags::empty(),
         )?;
@@ -153,14 +166,14 @@ where
         let mount_source = proc_fd_path(fd.as_raw_fd());
         mount_fn(
             Some(mount_source.as_str()),
-            path_str.as_str(),
+            mount_source.as_str(),
             None,
             MsFlags::MS_BIND,
         )?;
 
         mount_fn(
-            Some(path_str.as_str()),
-            path_str.as_str(),
+            Some(mount_source.as_str()),
+            mount_source.as_str(),
             None,
             MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY,
         )?;

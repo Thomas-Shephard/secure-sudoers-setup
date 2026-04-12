@@ -8,7 +8,9 @@ use secure_sudoers_common::models::IsolationSettings;
 #[cfg(test)]
 use capabilities::{drop_bounding_capabilities_with, drop_capabilities, parse_cap_last_cap};
 #[cfg(test)]
-use mounts::{apply_private_mounts_with, apply_readonly_mounts_with, mount_shadow_fd};
+use mounts::{
+    apply_private_mounts_with, apply_readonly_mounts_with, mount_shadow_fd, mount_shadow_fd_with,
+};
 #[cfg(test)]
 use nix::mount::{MsFlags, mount};
 #[cfg(test)]
@@ -382,6 +384,40 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_private_mounts_uses_fd_anchored_target() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target");
+        std::fs::create_dir(&base_path).expect("create base dir");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let paths = vec![base_path.clone()];
+        let mut seen_target = None::<String>;
+
+        apply_private_mounts_with(
+            &paths,
+            |_| Ok(()),
+            |source, target, fstype, flags| {
+                assert_eq!(source, Some("tmpfs"));
+                assert_eq!(fstype, Some("tmpfs"));
+                assert_eq!(flags, MsFlags::empty());
+                seen_target = Some(target.to_string());
+                Ok(())
+            },
+        )
+        .expect("private mount setup should succeed");
+
+        let seen_target = seen_target.expect("mount callback should be called");
+        assert!(
+            seen_target.starts_with("/proc/self/fd/"),
+            "private mount target should be fd-anchored, got '{seen_target}'"
+        );
+        assert_ne!(
+            seen_target, base_path,
+            "private mount target should not use the raw path string"
+        );
+    }
+
+    #[test]
     fn test_apply_readonly_mounts_rejects_path_swap_before_mount() {
         let dir = tempfile::TempDir::new().expect("tempdir");
         let base_path = dir.path().join("target");
@@ -427,6 +463,131 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(calls, 0, "mount should not be attempted after path swap");
+    }
+
+    #[test]
+    fn test_apply_readonly_mounts_uses_fd_anchored_target() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target");
+        std::fs::create_dir(&base_path).expect("create base dir");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let paths = vec![base_path.clone()];
+        let mut calls = Vec::<(Option<String>, String, MsFlags)>::new();
+
+        apply_readonly_mounts_with(
+            &paths,
+            |_| Ok(()),
+            |source, target, _fstype, flags| {
+                calls.push((source.map(str::to_owned), target.to_string(), flags));
+                Ok(())
+            },
+        )
+        .expect("readonly mount setup should succeed");
+
+        assert_eq!(calls.len(), 2, "readonly setup should issue bind + remount");
+        for (source, target, _flags) in &calls {
+            let source = source.as_deref().expect("source should be provided");
+            assert!(
+                source.starts_with("/proc/self/fd/"),
+                "readonly mount source should be fd-anchored, got '{source}'"
+            );
+            assert!(
+                target.starts_with("/proc/self/fd/"),
+                "readonly mount target should be fd-anchored, got '{target}'"
+            );
+            assert_eq!(
+                source, target,
+                "readonly mount source/target should anchor to the same fd path"
+            );
+            assert_ne!(
+                target, &base_path,
+                "readonly mount target should not use the raw path string"
+            );
+        }
+        assert_eq!(calls[0].2, MsFlags::MS_BIND);
+        assert_eq!(
+            calls[1].2,
+            MsFlags::MS_REMOUNT | MsFlags::MS_BIND | MsFlags::MS_RDONLY
+        );
+    }
+
+    #[test]
+    fn test_mount_shadow_fd_uses_fd_anchored_target_for_file() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target");
+        std::fs::write(&base_path, b"ORIGINAL").expect("write base path");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let fd = safe_traverse(&base_path, false).expect("safe_traverse");
+        let mut call = None::<(Option<String>, String, Option<String>, MsFlags)>;
+
+        mount_shadow_fd_with(
+            fd.as_raw_fd(),
+            &base_path,
+            |source, target, fstype, flags| {
+                call = Some((
+                    source.map(str::to_owned),
+                    target.to_string(),
+                    fstype.map(str::to_owned),
+                    flags,
+                ));
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .expect("shadow mount setup should succeed");
+
+        let (source, target, fstype, flags) = call.expect("mount callback should be called");
+        assert_eq!(source.as_deref(), Some("/dev/null"));
+        assert_eq!(fstype.as_deref(), None);
+        assert_eq!(flags, MsFlags::MS_BIND);
+        assert!(
+            target.starts_with("/proc/self/fd/"),
+            "shadow mount target should be fd-anchored, got '{target}'"
+        );
+        assert_ne!(
+            target, base_path,
+            "shadow mount target should not use the raw path string"
+        );
+    }
+
+    #[test]
+    fn test_mount_shadow_fd_uses_fd_anchored_target_for_directory() {
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base_path = dir.path().join("target");
+        std::fs::create_dir(&base_path).expect("create base dir");
+
+        let base_path = base_path.to_string_lossy().to_string();
+        let fd = safe_traverse(&base_path, false).expect("safe_traverse");
+        let mut call = None::<(Option<String>, String, Option<String>, MsFlags)>;
+
+        mount_shadow_fd_with(
+            fd.as_raw_fd(),
+            &base_path,
+            |source, target, fstype, flags| {
+                call = Some((
+                    source.map(str::to_owned),
+                    target.to_string(),
+                    fstype.map(str::to_owned),
+                    flags,
+                ));
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .expect("shadow mount setup should succeed");
+
+        let (source, target, fstype, flags) = call.expect("mount callback should be called");
+        assert_eq!(source.as_deref(), Some("tmpfs"));
+        assert_eq!(fstype.as_deref(), Some("tmpfs"));
+        assert_eq!(flags, MsFlags::empty());
+        assert!(
+            target.starts_with("/proc/self/fd/"),
+            "shadow mount target should be fd-anchored, got '{target}'"
+        );
+        assert_ne!(
+            target, base_path,
+            "shadow mount target should not use the raw path string"
+        );
     }
 
     #[test]
