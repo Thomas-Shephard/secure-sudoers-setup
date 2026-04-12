@@ -40,6 +40,21 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Verify Minimum Kernel Version (4.19+)
+        run: |
+          kernel_release="$(uname -r)"
+          kernel_major="${kernel_release%%.*}"
+          kernel_rest="${kernel_release#*.}"
+          kernel_minor="${kernel_rest%%.*}"
+          if ! [[ "$kernel_major" =~ ^[0-9]+$ && "$kernel_minor" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: Unable to parse kernel version from: $kernel_release"
+            exit 1
+          fi
+          if (( kernel_major < 4 || (kernel_major == 4 && kernel_minor < 19) )); then
+            echo "ERROR: secure-sudoers requires Linux kernel 4.19+ (found: $kernel_release)"
+            exit 1
+          fi
+          echo "Kernel requirement satisfied (>= 4.19): $kernel_release"
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
       - name: Build Privileged Test Image

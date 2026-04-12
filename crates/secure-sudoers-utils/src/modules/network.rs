@@ -285,12 +285,7 @@ fn read_existing_immutable(path: &Path) -> std::io::Result<Option<bool>> {
 
     let e = std::io::Error::last_os_error();
     match e.raw_os_error() {
-        Some(code)
-            if code == libc::ENOTTY
-                || code == libc::EOPNOTSUPP
-                || code == libc::EINVAL
-                || code == libc::ENOSYS =>
-        {
+        Some(code) if code == libc::ENOTTY || code == libc::EOPNOTSUPP || code == libc::EINVAL => {
             Ok(Some(false))
         }
         _ => Err(e),

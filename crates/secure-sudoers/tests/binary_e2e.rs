@@ -14,6 +14,8 @@ use predicates::str::contains;
 use rand_core::OsRng;
 use tempfile::TempDir;
 
+const TEST_KERNEL_RELEASE_ENV: &str = "SECURE_SUDOERS_TEST_KERNEL_RELEASE";
+
 fn generate_keypair() -> (SigningKey, [u8; 32]) {
     let sk = SigningKey::generate(&mut OsRng);
     let vk = sk.verifying_key().to_bytes();
@@ -47,6 +49,33 @@ const EMPTY_TOOLS_POLICY: &str = r#"{
   },
   "tools": {}
 }"#;
+
+#[test]
+fn test_binary_rejects_kernel_below_4_19() {
+    ss_cmd()
+        .env(TEST_KERNEL_RELEASE_ENV, "4.18.20")
+        .arg("sometool")
+        .assert()
+        .failure()
+        .stderr(contains("requires Linux kernel 4.19 or newer"))
+        .stderr(contains("Cannot load policy").not());
+}
+
+#[test]
+fn test_binary_accepts_supported_kernel_release() {
+    ss_cmd()
+        .env(TEST_KERNEL_RELEASE_ENV, "4.19.0-200.el8")
+        .env(
+            "SECURE_SUDOERS_POLICY_PATH",
+            "/nonexistent/path/policy.json",
+        )
+        .env("SECURE_SUDOERS_PUBKEY_PATH", "/dev/null")
+        .arg("sometool")
+        .assert()
+        .failure()
+        .stderr(contains("Cannot load policy"))
+        .stderr(contains("requires Linux kernel 4.19 or newer").not());
+}
 
 #[test]
 fn test_binary_missing_policy_exits_fatally() {

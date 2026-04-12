@@ -6,17 +6,29 @@ use secure_sudoers::helpers::invocation::parse_invocation_current_process;
 use secure_sudoers::helpers::policy::load_policy;
 use secure_sudoers::helpers::redaction::redact_args;
 use secure_sudoers::supervisor;
+use secure_sudoers_common::error::Error;
 use secure_sudoers_common::telemetry::{
     self, AccountType, ContextInfo, IdentityInfo, PolicyInfo, SecurityEvent,
 };
-use secure_sudoers_common::{logging, validator};
+use secure_sudoers_common::{kernel, logging, validator};
 use std::os::fd::AsRawFd;
 use tracing::{error, info, warn};
 
 const POLICY_PATH: &str = "/etc/secure-sudoers/policy.json";
 
 fn main() {
-    let txn_id = generate_txn_id();
+    if let Err(e) = kernel::ensure_minimum_kernel_version() {
+        eprintln!("FATAL: {e}");
+        std::process::exit(1);
+    }
+
+    let txn_id = match generate_txn_id() {
+        Ok(txn_id) => txn_id,
+        Err(e) => {
+            eprintln!("FATAL: {e}");
+            std::process::exit(1);
+        }
+    };
 
     #[cfg(debug_assertions)]
     let policy_path =
@@ -204,19 +216,38 @@ fn main() {
     }
 }
 
-fn generate_txn_id() -> String {
+fn generate_txn_id() -> Result<String, Error> {
     let mut buf = [0u8; 4];
-    if unsafe { libc::getrandom(buf.as_mut_ptr() as *mut libc::c_void, 4, 0) } == 4 {
-        format!("{:08x}", u32::from_be_bytes(buf))
-    } else {
-        // Fallback to XOR pid with current nanoseconds for collision resistance
-        use std::time::{SystemTime, UNIX_EPOCH};
-        let nanos = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!("{:08x}", (std::process::id() as u128 ^ nanos) as u32)
+    let mut filled = 0usize;
+
+    while filled < buf.len() {
+        let rc = unsafe {
+            libc::getrandom(
+                buf[filled..].as_mut_ptr() as *mut libc::c_void,
+                (buf.len() - filled) as libc::size_t,
+                0,
+            )
+        };
+
+        if rc > 0 {
+            filled += rc as usize;
+        } else if rc == 0 {
+            return Err(Error::System(
+                "Security failure: getrandom(2) returned zero bytes while creating transaction id"
+                    .to_string(),
+            ));
+        } else {
+            let err = std::io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(Error::System(format!(
+                "Security failure: getrandom(2) failed while creating transaction id: {err}"
+            )));
+        }
     }
+
+    Ok(format!("{:08x}", u32::from_be_bytes(buf)))
 }
 
 fn hash_path_for_telemetry(path: &str) -> Option<String> {

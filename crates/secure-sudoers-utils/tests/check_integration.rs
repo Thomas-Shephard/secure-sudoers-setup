@@ -1,6 +1,8 @@
 use std::process::Command;
 use tempfile::tempdir;
 
+const TEST_KERNEL_RELEASE_ENV: &str = "SECURE_SUDOERS_TEST_KERNEL_RELEASE";
+
 #[test]
 fn test_check_command_on_valid_policy() {
     let dir = tempdir().unwrap();
@@ -97,4 +99,50 @@ fn test_check_command_on_invalid_policy_missing_binary() {
         "check command should fail for policy with missing binary"
     );
     assert!(String::from_utf8_lossy(&output.stderr).contains("does not exist on the filesystem"));
+}
+
+#[test]
+fn test_check_command_rejects_kernel_below_4_19() {
+    let missing_policy_path = tempdir().unwrap().path().join("missing-policy.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_secure-sudoers-utils"))
+        .env(TEST_KERNEL_RELEASE_ENV, "4.18.20")
+        .args(["check", missing_policy_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute secure-sudoers-utils");
+
+    assert!(
+        !output.status.success(),
+        "check command should fail on unsupported kernels"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("requires Linux kernel 4.19 or newer"),
+        "expected kernel gate error, got: {stderr}"
+    );
+}
+
+#[test]
+fn test_check_command_allows_supported_kernel_release_to_continue() {
+    let missing_policy_path = tempdir().unwrap().path().join("missing-policy.json");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_secure-sudoers-utils"))
+        .env(TEST_KERNEL_RELEASE_ENV, "4.19.0")
+        .args(["check", missing_policy_path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute secure-sudoers-utils");
+
+    assert!(
+        !output.status.success(),
+        "check command should fail because the policy file is missing"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("Cannot read"),
+        "expected normal policy read failure, got: {stderr}"
+    );
+    assert!(
+        !stderr.contains("requires Linux kernel 4.19 or newer"),
+        "kernel gate should not trigger for supported releases"
+    );
 }

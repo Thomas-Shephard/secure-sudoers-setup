@@ -19,6 +19,16 @@ The tool is intended to replace traditional access to sudo by enforcing the **pr
 4. **Validation**: Arguments are matched against the rules in the policy.
 5. **Execution**: If valid, the process executes the command in a secure, isolated environment.
 
+## System Requirements
+- **Linux kernel**: **4.19 or newer** (enforced at runtime by `secure-sudoers` and `secure-sudoers-utils`).
+- **Privileges**: Root is required for `install`, `unlock`, and `update`.
+- **Tools**: `chattr` (for immutable hardening).
+
+Optional namespace smoke test with bubblewrap:
+```bash
+bwrap --ro-bind / / /bin/sh -c 'uname -r'
+```
+
 ## Setup Guide
 
 Follow these steps to set up Secure Sudoers on your system.

@@ -2,6 +2,7 @@
 pub mod error;
 
 pub mod fs;
+pub mod kernel;
 pub mod logging;
 pub mod models;
 pub mod telemetry;

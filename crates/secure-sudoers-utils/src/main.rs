@@ -2,6 +2,7 @@
 
 use clap::{CommandFactory, Parser, Subcommand};
 use secure_sudoers_common::error::Error;
+use secure_sudoers_common::kernel;
 #[cfg(feature = "network-update")]
 use secure_sudoers_utils::modules::network;
 use secure_sudoers_utils::modules::{installer, keys};
@@ -40,6 +41,11 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
+
+    if let Err(e) = kernel::ensure_minimum_kernel_version() {
+        eprintln!("Error: {e}");
+        std::process::exit(1);
+    }
 
     if !matches!(
         cli.command,
