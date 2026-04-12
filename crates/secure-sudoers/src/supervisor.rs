@@ -1,17 +1,190 @@
 use crate::exec;
+use crate::signal_utils::{
+    fast_exit, is_job_control_stop_signal, post_fork_stderr, suspend_self_for_job_control,
+};
 use secure_sudoers_common::error::Error;
 use secure_sudoers_common::models::SecureSudoersPolicy;
 use secure_sudoers_common::validator::ValidatedCommand;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::Duration;
+use tracing::{error, warn};
 
 static SIGWINCH_RECEIVED: AtomicBool = AtomicBool::new(false);
+static FORWARDED_CHILD_PGID: AtomicI32 = AtomicI32::new(0);
+static TERMINATION_SIGNAL: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn sigwinch_handler(_: libc::c_int) {
     SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
 }
 
-pub fn run_supervisor(cmd: &ValidatedCommand, policy: &SecureSudoersPolicy) -> Result<i32, Error> {
+extern "C" fn sigint_handler(_: libc::c_int) {
+    forward_signal_to_supervised_group(libc::SIGINT);
+}
+
+extern "C" fn sigquit_handler(_: libc::c_int) {
+    forward_signal_to_supervised_group(libc::SIGQUIT);
+}
+
+extern "C" fn sigtstp_handler(_: libc::c_int) {
+    forward_signal_to_supervised_group(libc::SIGTSTP);
+}
+
+extern "C" fn sigttin_handler(_: libc::c_int) {
+    forward_signal_to_supervised_group(libc::SIGTTIN);
+}
+
+extern "C" fn sigttou_handler(_: libc::c_int) {
+    forward_signal_to_supervised_group(libc::SIGTTOU);
+}
+
+extern "C" fn sigterm_handler(_: libc::c_int) {
+    TERMINATION_SIGNAL.store(libc::SIGTERM, Ordering::SeqCst);
+    forward_signal_to_supervised_group(libc::SIGTERM);
+}
+
+extern "C" fn sighup_handler(_: libc::c_int) {
+    TERMINATION_SIGNAL.store(libc::SIGHUP, Ordering::SeqCst);
+    forward_signal_to_supervised_group(libc::SIGHUP);
+}
+
+fn forward_signal_to_supervised_group(signal: libc::c_int) {
+    let pgid = FORWARDED_CHILD_PGID.load(Ordering::SeqCst);
+    if pgid > 0 {
+        unsafe {
+            libc::kill(-pgid, signal);
+        }
+    }
+}
+
+const CHILD_STAGE_SET_OWN_PGID: &[u8] = b"set_own_process_group";
+const CHILD_STAGE_SET_PDEATHSIG: &[u8] = b"set_parent_death_signal";
+const CHILD_STAGE_RESTORE_MASK: &[u8] = b"restore_signal_mask";
+const CHILD_STAGE_EXECUTE_SECURELY: &[u8] = b"execute_securely";
+
+fn create_child_error_pipe() -> Result<(OwnedFd, OwnedFd), Error> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } != 0 {
+        return Err(Error::IoContext(
+            "pipe2 for supervisor child error channel failed".to_string(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    let read_fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write_fd = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read_fd, write_fd))
+}
+
+fn write_child_error_stage(write_fd: &OwnedFd, stage: &'static [u8]) {
+    let _ = unsafe {
+        libc::write(
+            write_fd.as_raw_fd(),
+            stage.as_ptr() as *const libc::c_void,
+            stage.len(),
+        )
+    };
+}
+
+fn read_child_error_stage(read_fd: &OwnedFd) -> Result<Option<&'static str>, Error> {
+    let mut buf = [0u8; 128];
+    loop {
+        let bytes_read = unsafe {
+            libc::read(
+                read_fd.as_raw_fd(),
+                buf.as_mut_ptr() as *mut libc::c_void,
+                buf.len(),
+            )
+        };
+
+        if bytes_read > 0 {
+            let bytes = &buf[..bytes_read as usize];
+            if bytes.starts_with(CHILD_STAGE_SET_OWN_PGID) {
+                return Ok(Some("set_own_process_group"));
+            }
+            if bytes.starts_with(CHILD_STAGE_SET_PDEATHSIG) {
+                return Ok(Some("set_parent_death_signal"));
+            }
+            if bytes.starts_with(CHILD_STAGE_RESTORE_MASK) {
+                return Ok(Some("restore_signal_mask"));
+            }
+            if bytes.starts_with(CHILD_STAGE_EXECUTE_SECURELY) {
+                return Ok(Some("execute_securely"));
+            }
+            return Ok(Some("unknown_post_fork_stage"));
+        }
+
+        if bytes_read == 0 {
+            return Ok(None);
+        }
+
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error() {
+            Some(libc::EAGAIN) => return Ok(None),
+            Some(libc::EINTR) => continue,
+            _ => {
+                return Err(Error::IoContext(
+                    "read supervisor child error channel failed".to_string(),
+                    err,
+                ));
+            }
+        }
+    }
+}
+
+fn block_forwarded_signals() -> Result<libc::sigset_t, Error> {
+    let mut set = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    if unsafe { libc::sigemptyset(&mut set) } != 0 {
+        return Err(Error::IoContext(
+            "sigemptyset for forwarding mask failed".to_string(),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    for signal in [
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+        libc::SIGTERM,
+        libc::SIGHUP,
+    ] {
+        if unsafe { libc::sigaddset(&mut set, signal) } != 0 {
+            return Err(Error::IoContext(
+                format!("sigaddset({signal}) failed"),
+                std::io::Error::last_os_error(),
+            ));
+        }
+    }
+
+    let mut old_mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old_mask) };
+    if rc != 0 {
+        return Err(Error::IoContext(
+            "pthread_sigmask(SIG_BLOCK) failed".to_string(),
+            std::io::Error::from_raw_os_error(rc),
+        ));
+    }
+    Ok(old_mask)
+}
+
+fn restore_signal_mask(old_mask: &libc::sigset_t) -> Result<(), Error> {
+    let rc = unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, old_mask, std::ptr::null_mut()) };
+    if rc != 0 {
+        return Err(Error::IoContext(
+            "pthread_sigmask(SIG_SETMASK) failed".to_string(),
+            std::io::Error::from_raw_os_error(rc),
+        ));
+    }
+    Ok(())
+}
+
+pub fn run_supervisor(
+    cmd: &ValidatedCommand,
+    policy: &SecureSudoersPolicy,
+    txn_id: &str,
+) -> Result<i32, Error> {
+    let supervisor_pid = nix::unistd::getpid();
     let stdin_is_tty = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
     let mut _tg = None;
 
@@ -20,37 +193,174 @@ pub fn run_supervisor(cmd: &ValidatedCommand, policy: &SecureSudoersPolicy) -> R
         install_sigwinch_handler()?;
     }
     set_subreaper()?;
+    FORWARDED_CHILD_PGID.store(0, Ordering::SeqCst);
+    TERMINATION_SIGNAL.store(0, Ordering::SeqCst);
+    let old_mask = block_forwarded_signals()?;
+    let (child_error_read, child_error_write) = match create_child_error_pipe() {
+        Ok(fds) => fds,
+        Err(e) => {
+            let _ = restore_signal_mask(&old_mask);
+            return Err(e);
+        }
+    };
 
     match unsafe { nix::unistd::fork() } {
         Ok(nix::unistd::ForkResult::Parent { child }) => {
-            unsafe {
-                libc::signal(libc::SIGINT, libc::SIG_IGN);
-                libc::signal(libc::SIGQUIT, libc::SIG_IGN);
+            drop(child_error_write);
+            let setup_result = (|| {
+                set_child_process_group(child)?;
+                FORWARDED_CHILD_PGID.store(child.as_raw(), Ordering::SeqCst);
+                install_signal_forwarding_handlers()
+            })();
+            let restore_result = restore_signal_mask(&old_mask);
+            let forwarding_handlers = match setup_result {
+                Ok(handlers) => handlers,
+                Err(e) => {
+                    FORWARDED_CHILD_PGID.store(0, Ordering::SeqCst);
+                    let setup_err = if let Err(mask_err) = restore_result {
+                        Error::Execution(format!("{e}; restore signal mask failed: {mask_err}"))
+                    } else {
+                        e
+                    };
+                    return return_with_setup_child_cleanup(child, setup_err);
+                }
+            };
+            if let Err(e) = restore_result {
+                FORWARDED_CHILD_PGID.store(0, Ordering::SeqCst);
+                drop(forwarding_handlers);
+                return return_with_setup_child_cleanup(child, e);
             }
-            set_child_process_group(child)?;
-            supervise_direct_child(child, stdin_is_tty)
+
+            let supervise_result = supervise_direct_child(child, stdin_is_tty, txn_id);
+            FORWARDED_CHILD_PGID.store(0, Ordering::SeqCst);
+            let child_stage = read_child_error_stage(&child_error_read)?;
+            drop(forwarding_handlers);
+
+            if let Some(stage) = child_stage {
+                let detail = match &supervise_result {
+                    Ok(code) => format!("exit code {code}"),
+                    Err(e) => format!("supervisor error: {e}"),
+                };
+                return Err(Error::Execution(format!(
+                    "supervisor child failed before delegation at stage '{stage}' ({detail})"
+                )));
+            }
+
+            supervise_result
         }
         Ok(nix::unistd::ForkResult::Child) => {
-            set_own_process_group()?;
-            set_parent_death_signal(libc::SIGKILL)?;
-            if let Err(e) = exec::execute_securely(cmd, policy) {
-                eprintln!("FATAL: {e}");
-                std::process::exit(1);
+            drop(child_error_read);
+            if set_parent_death_signal(libc::SIGKILL).is_err() {
+                write_child_error_stage(&child_error_write, CHILD_STAGE_SET_PDEATHSIG);
+                post_fork_stderr(b"FATAL: set_parent_death_signal failed\n");
+                fast_exit(1);
             }
-            std::process::exit(0);
+            if nix::unistd::getppid() != supervisor_pid {
+                write_child_error_stage(&child_error_write, CHILD_STAGE_SET_PDEATHSIG);
+                post_fork_stderr(b"FATAL: supervisor parent changed before delegation startup\n");
+                fast_exit(1);
+            }
+            if set_own_process_group().is_err() {
+                write_child_error_stage(&child_error_write, CHILD_STAGE_SET_OWN_PGID);
+                post_fork_stderr(b"FATAL: set_own_process_group failed\n");
+                fast_exit(1);
+            }
+            if restore_signal_mask(&old_mask).is_err() {
+                write_child_error_stage(&child_error_write, CHILD_STAGE_RESTORE_MASK);
+                post_fork_stderr(b"FATAL: restore_signal_mask failed\n");
+                fast_exit(1);
+            }
+            match exec::execute_securely(cmd, policy, Some(child_error_write.as_raw_fd())) {
+                Err(_) => fast_exit(1),
+                Ok(()) => {
+                    // This arm is effectively unreachable: execute_securely's internal
+                    // parent exits with the delegated child status.
+                    write_child_error_stage(&child_error_write, CHILD_STAGE_EXECUTE_SECURELY);
+                    post_fork_stderr(b"FATAL: execute_securely returned unexpectedly\n");
+                    fast_exit(1);
+                }
+            }
         }
-        Err(e) => Err(Error::Execution(format!("fork failed: {e}"))),
+        Err(e) => {
+            let _ = restore_signal_mask(&old_mask);
+            Err(Error::Execution(format!("fork failed: {e}")))
+        }
     }
 }
 
-fn supervise_direct_child(child: nix::unistd::Pid, stdin_is_tty: bool) -> Result<i32, Error> {
+fn return_with_setup_child_cleanup(child: nix::unistd::Pid, err: Error) -> Result<i32, Error> {
+    if let Err(cleanup_err) = terminate_setup_child(child) {
+        return Err(Error::Execution(format!(
+            "{err}; setup child cleanup failed: {cleanup_err}"
+        )));
+    }
+    Err(err)
+}
+
+fn terminate_setup_child(child: nix::unistd::Pid) -> Result<(), Error> {
+    let child_pid = child.as_raw();
+
+    if unsafe { libc::kill(child_pid, libc::SIGKILL) } != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() != Some(libc::ESRCH) {
+            return Err(Error::IoContext(
+                format!("kill({child_pid}, SIGKILL) failed during setup cleanup"),
+                err,
+            ));
+        }
+    }
+
+    if let Err(e) = send_signal_to_process_group(child_pid, libc::SIGKILL) {
+        return Err(Error::Execution(format!(
+            "failed to kill setup child process group: {e}"
+        )));
+    }
+
     loop {
-        if SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) && stdin_is_tty {
-            let child_tty = open_child_stdin_tty(child);
-            let _ = forward_winsize_with_child_tty(child, child_tty.as_ref());
+        match nix::sys::wait::waitpid(child, None) {
+            Ok(_) => return Ok(()),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(nix::errno::Errno::ECHILD) => return Ok(()),
+            Err(e) => {
+                return Err(Error::IoContext(
+                    format!("waitpid({child_pid}) failed during setup cleanup"),
+                    std::io::Error::from(e),
+                ));
+            }
+        }
+    }
+}
+
+fn supervise_direct_child(
+    child: nix::unistd::Pid,
+    stdin_is_tty: bool,
+    txn_id: &str,
+) -> Result<i32, Error> {
+    loop {
+        let termination_signal = TERMINATION_SIGNAL.swap(0, Ordering::SeqCst);
+        if termination_signal > 0 {
+            terminate_supervised_descendants(child)?;
+            return Err(Error::Execution(format!(
+                "supervisor received termination signal {termination_signal}"
+            )));
         }
 
-        match nix::sys::wait::waitpid(child, None) {
+        if SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) && stdin_is_tty {
+            let child_tty = open_child_stdin_tty(child);
+            if let Err(e) = forward_winsize_with_child_tty(child, child_tty.as_ref()) {
+                warn!(
+                    txn_id = %txn_id,
+                    child_pid = child.as_raw(),
+                    reason = %e,
+                    "Failed to propagate terminal resize to delegated command process group"
+                );
+            }
+        }
+
+        match nix::sys::wait::waitpid(
+            child,
+            Some(nix::sys::wait::WaitPidFlag::WUNTRACED | nix::sys::wait::WaitPidFlag::WCONTINUED),
+        ) {
             Ok(nix::sys::wait::WaitStatus::Exited(_, code)) => {
                 terminate_supervised_descendants(child)?;
                 return Ok(code);
@@ -59,17 +369,63 @@ fn supervise_direct_child(child: nix::unistd::Pid, stdin_is_tty: bool) -> Result
                 terminate_supervised_descendants(child)?;
                 return Ok(128 + sig as i32);
             }
+            Ok(nix::sys::wait::WaitStatus::Stopped(_, sig)) => {
+                let signal_raw = sig as libc::c_int;
+                if !is_job_control_stop_signal(sig) {
+                    let err = Error::System(format!(
+                        "unexpected non-job-control stop signal: {signal_raw}"
+                    ));
+                    log_supervisor_failure(txn_id, "wait_supervised", &err);
+                    return return_with_descendant_cleanup(child, err);
+                }
+                warn!(
+                    txn_id = %txn_id,
+                    child_pid = child.as_raw(),
+                    signal = signal_raw,
+                    "Supervised child stopped; propagating stop to supervisor"
+                );
+                if let Err(e) = suspend_self_for_job_control(signal_raw) {
+                    return return_with_descendant_cleanup(child, e);
+                }
+                if let Err(e) = send_signal_to_process_group(child.as_raw(), libc::SIGCONT) {
+                    return return_with_descendant_cleanup(child, e);
+                }
+                continue;
+            }
+            Ok(nix::sys::wait::WaitStatus::Continued(_)) => continue,
             Err(nix::errno::Errno::EINTR) => continue,
             Err(e) => {
-                let _ = terminate_supervised_descendants(child);
-                return Err(Error::IoContext(
-                    format!("waitpid for child {child} failed"),
-                    std::io::Error::from(e),
-                ));
+                let mut context = format!("waitpid for child {child} failed");
+                if let Err(term_err) = terminate_supervised_descendants(child) {
+                    context.push_str(&format!("; cleanup also failed: {term_err}"));
+                }
+                return Err(Error::IoContext(context, std::io::Error::from(e)));
             }
-            _ => continue,
+            Ok(status) => {
+                let err = Error::System(format!("Unexpected wait status: {status:?}"));
+                log_supervisor_failure(txn_id, "wait_supervised", &err);
+                return return_with_descendant_cleanup(child, err);
+            }
         }
     }
+}
+
+fn return_with_descendant_cleanup(child: nix::unistd::Pid, err: Error) -> Result<i32, Error> {
+    if let Err(cleanup_err) = terminate_supervised_descendants(child) {
+        return Err(Error::Execution(format!(
+            "{err}; cleanup failed: {cleanup_err}"
+        )));
+    }
+    Err(err)
+}
+
+fn log_supervisor_failure(txn_id: &str, stage: &'static str, err: &Error) {
+    error!(
+        txn_id = %txn_id,
+        stage,
+        reason = %err,
+        "Supervisor stage failed"
+    );
 }
 
 fn set_own_process_group() -> Result<(), Error> {
@@ -288,19 +644,77 @@ impl Drop for TerminalGuard {
 }
 
 fn install_sigwinch_handler() -> Result<(), Error> {
-    let sa = libc::sigaction {
-        sa_sigaction: sigwinch_handler as *const () as usize,
+    install_signal_handler(libc::SIGWINCH, sigwinch_handler).map(|_| ())
+}
+
+struct ForwardingSignalHandlerGuard {
+    installed: Vec<(libc::c_int, libc::sigaction)>,
+}
+
+impl ForwardingSignalHandlerGuard {
+    fn new() -> Self {
+        Self {
+            installed: Vec::new(),
+        }
+    }
+
+    fn install(
+        &mut self,
+        signal: libc::c_int,
+        handler: extern "C" fn(libc::c_int),
+    ) -> Result<(), Error> {
+        let old = install_signal_handler(signal, handler)?;
+        self.installed.push((signal, old));
+        Ok(())
+    }
+}
+
+impl Drop for ForwardingSignalHandlerGuard {
+    fn drop(&mut self) {
+        for (signal, old_action) in self.installed.iter().rev() {
+            unsafe {
+                libc::sigaction(*signal, old_action, std::ptr::null_mut());
+            }
+        }
+    }
+}
+
+fn install_signal_forwarding_handlers() -> Result<ForwardingSignalHandlerGuard, Error> {
+    let mut guard = ForwardingSignalHandlerGuard::new();
+    guard.install(libc::SIGINT, sigint_handler)?;
+    guard.install(libc::SIGQUIT, sigquit_handler)?;
+    guard.install(libc::SIGTSTP, sigtstp_handler)?;
+    guard.install(libc::SIGTTIN, sigttin_handler)?;
+    guard.install(libc::SIGTTOU, sigttou_handler)?;
+    guard.install(libc::SIGTERM, sigterm_handler)?;
+    guard.install(libc::SIGHUP, sighup_handler)?;
+    Ok(guard)
+}
+
+fn install_signal_handler(
+    signal: libc::c_int,
+    handler: extern "C" fn(libc::c_int),
+) -> Result<libc::sigaction, Error> {
+    let mut sa = libc::sigaction {
+        sa_sigaction: handler as *const () as usize,
         sa_mask: unsafe { std::mem::zeroed() },
         sa_flags: 0,
         sa_restorer: None,
     };
-    if unsafe { libc::sigaction(libc::SIGWINCH, &sa, std::ptr::null_mut()) } != 0 {
+    if unsafe { libc::sigemptyset(&mut sa.sa_mask) } != 0 {
         return Err(Error::IoContext(
-            "sigaction failed".to_string(),
+            "sigemptyset failed".to_string(),
             std::io::Error::last_os_error(),
         ));
     }
-    Ok(())
+    let mut old_sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sigaction(signal, &sa, &mut old_sa) } != 0 {
+        return Err(Error::IoContext(
+            format!("sigaction({signal}) failed"),
+            std::io::Error::last_os_error(),
+        ));
+    }
+    Ok(old_sa)
 }
 
 struct ChildTtyForwarding {
@@ -453,7 +867,7 @@ mod tests {
                 IsolationSettings::default(),
                 vec![],
             );
-            match run_supervisor(&cmd, &policy) {
+            match run_supervisor(&cmd, &policy, "test-txn-id") {
                 Ok(0) => true,
                 Ok(c) => {
                     eprintln!("  exit code {c}");
@@ -685,7 +1099,8 @@ mod tests {
                 assert_eq!(off, buf.len(), "failed to read daemon pid");
                 let daemon_pid = i32::from_ne_bytes(buf);
 
-                let exit_code = supervise_direct_child(child, false).expect("supervise failed");
+                let exit_code =
+                    supervise_direct_child(child, false, "test-txn-id").expect("supervise failed");
                 assert_eq!(exit_code, 0);
 
                 std::thread::sleep(std::time::Duration::from_millis(100));
@@ -888,7 +1303,7 @@ mod tests {
                     }
 
                     SIGWINCH_RECEIVED.store(true, Ordering::SeqCst);
-                    let exit_code = supervise_direct_child(child, true).ok();
+                    let exit_code = supervise_direct_child(child, true, "test-txn-id").ok();
                     if exit_code != Some(0) {
                         unsafe {
                             libc::close(source_master);

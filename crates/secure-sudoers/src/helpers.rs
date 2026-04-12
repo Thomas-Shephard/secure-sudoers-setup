@@ -775,7 +775,7 @@ mod tests {
         let mut policy = make_policy();
         policy.global_settings.blocked_paths.clear();
 
-        let result = run_supervisor(&cmd, &policy);
+        let result = run_supervisor(&cmd, &policy, "test-txn-id");
         assert_eq!(result.unwrap(), 0, "/usr/bin/true must exit 0");
     }
 }

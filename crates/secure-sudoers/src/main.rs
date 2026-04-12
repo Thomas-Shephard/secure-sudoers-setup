@@ -172,7 +172,7 @@ fn main() {
                 "Command approved"
             );
 
-            match supervisor::run_supervisor(&cmd, &policy) {
+            match supervisor::run_supervisor(&cmd, &policy, txn_id.as_str()) {
                 Ok(exit_code) => std::process::exit(exit_code),
                 Err(e) => {
                     let ev_err = SecurityEvent {
