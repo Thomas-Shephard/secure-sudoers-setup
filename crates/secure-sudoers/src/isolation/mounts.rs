@@ -164,14 +164,7 @@ pub(super) fn pin_path_at_fd(fd: i32, canonical_path: &str) -> Result<(), Error>
         )
     })?;
 
-    // Prefer matching against the originally validated FD. For paths that are
-    // already file mountpoints (e.g. container-provided /etc/hosts), the
-    // kernel may present identity details through the post-unshare FD path
-    // differently after a self-bind. In that case, confirm against target_fd,
-    // which was already matched to the validated source before the mount.
-    if let Err(primary_err) = ensure_path_matches_fd(canonical_path, fd) {
-        ensure_path_matches_fd(canonical_path, target_fd.as_raw_fd()).map_err(|_| primary_err)?;
-    }
+    ensure_path_matches_fd(canonical_path, fd)?;
     Ok(())
 }
 
@@ -228,9 +221,7 @@ where
 
     // Final check: the visible argument path must still resolve to the same
     // validated inode immediately before delegated exec.
-    if let Err(primary_err) = ensure_path_matches_fd(canonical_path, fd) {
-        ensure_path_matches_fd(canonical_path, target_fd.as_raw_fd()).map_err(|_| primary_err)?;
-    }
+    ensure_path_matches_fd(canonical_path, fd)?;
     Ok(())
 }
 
