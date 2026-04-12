@@ -4,6 +4,7 @@ mod path_guard;
 
 use secure_sudoers_common::error::Error;
 use secure_sudoers_common::models::IsolationSettings;
+use std::path::Path;
 
 #[cfg(test)]
 use capabilities::{drop_bounding_capabilities_with, drop_capabilities, parse_cap_last_cap};
@@ -33,8 +34,24 @@ pub fn setup_isolation(
     Ok(())
 }
 
-pub(crate) fn pin_validated_path_argument(fd: i32, canonical_path: &str) -> Result<(), Error> {
-    mounts::pin_validated_path_argument(fd, canonical_path)
+pub(crate) fn canonical_parent_path(canonical_path: &str) -> Result<&str, Error> {
+    let parent_path = Path::new(canonical_path).parent().ok_or_else(|| {
+        Error::Validation(format!(
+            "Path '{}' has no parent for pinning",
+            canonical_path
+        ))
+    })?;
+    Ok(parent_path
+        .to_str()
+        .expect("parent of valid UTF-8 path must be UTF-8"))
+}
+
+pub(crate) fn pin_validated_path_parent(parent_path: &str) -> Result<(), Error> {
+    mounts::pin_validated_path_parent(parent_path)
+}
+
+pub(crate) fn pin_path_at_fd(fd: i32, canonical_path: &str) -> Result<(), Error> {
+    mounts::pin_path_at_fd(fd, canonical_path)
 }
 
 #[cfg(test)]
@@ -58,6 +75,26 @@ mod tests {
 
     use std::sync::Mutex;
     static GLOBAL_PATH: Mutex<Option<String>> = Mutex::new(None);
+
+    fn pin_parent_chain_for_path(canonical_path: &str) -> Result<(), Error> {
+        if canonical_path == "/" {
+            return Ok(());
+        }
+        let mut parent_chain = Vec::<&str>::new();
+        let mut current_path = canonical_path;
+        loop {
+            let parent_path = canonical_parent_path(current_path)?;
+            if parent_path == "/" {
+                break;
+            }
+            parent_chain.push(parent_path);
+            current_path = parent_path;
+        }
+        for parent_path in parent_chain.into_iter().rev() {
+            pin_validated_path_parent(parent_path)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_setup_isolation_blocks_path() {
@@ -758,21 +795,35 @@ mod tests {
 
         let base_path = base_path.to_string_lossy().to_string();
         let fd = safe_traverse(&base_path, false).expect("safe_traverse");
-        let mut call = None::<(Option<String>, String, MsFlags)>;
+        let mut calls = Vec::<(Option<String>, String, String, MsFlags)>::new();
 
         pin_validated_path_argument_with(
             fd.as_raw_fd(),
             &base_path,
             |_| Ok(()),
             |source, target, _fstype, flags| {
-                call = Some((source.map(str::to_owned), target.to_string(), flags));
+                let resolved_target = std::fs::read_link(target)
+                    .expect("target fd path should resolve while pinning")
+                    .to_string_lossy()
+                    .to_string();
+                calls.push((
+                    source.map(str::to_owned),
+                    target.to_string(),
+                    resolved_target,
+                    flags,
+                ));
                 Ok::<(), std::io::Error>(())
             },
         )
         .expect("path pinning setup should succeed");
 
-        let (source, target, flags) = call.expect("mount callback should be called");
-        let source = source.expect("bind source should be provided");
+        assert_eq!(
+            calls.len(),
+            1,
+            "path-only pinning helper should install one file self-bind mountpoint"
+        );
+        let (source, target, resolved_target, flags) = &calls[0];
+        let source = source.as_deref().expect("bind source should be provided");
         assert!(
             source.starts_with("/proc/self/fd/"),
             "bind source should be fd-anchored, got '{source}'"
@@ -782,10 +833,66 @@ mod tests {
             "bind target should be fd-anchored, got '{target}'"
         );
         assert_ne!(
-            target, base_path,
+            target, &base_path,
             "bind target should not use the raw path string"
         );
-        assert_eq!(flags, MsFlags::MS_BIND);
+        assert_eq!(
+            resolved_target, &base_path,
+            "file pinning mount target should resolve to the validated file path"
+        );
+        assert_eq!(*flags, MsFlags::MS_BIND);
+        assert_eq!(
+            source, target,
+            "pinning uses self-bind on fd-anchored mountpoints"
+        );
+    }
+
+    #[test]
+    fn test_pin_validated_path_argument_root_skips_parent_lock() {
+        let root_path = "/".to_string();
+        let fd = safe_traverse(&root_path, false).expect("safe_traverse");
+        let mut calls = Vec::<(Option<String>, String, String, MsFlags)>::new();
+
+        pin_validated_path_argument_with(
+            fd.as_raw_fd(),
+            &root_path,
+            |_| Ok(()),
+            |source, target, _fstype, flags| {
+                let resolved_target = std::fs::read_link(target)
+                    .expect("target fd path should resolve while pinning")
+                    .to_string_lossy()
+                    .to_string();
+                calls.push((
+                    source.map(str::to_owned),
+                    target.to_string(),
+                    resolved_target,
+                    flags,
+                ));
+                Ok::<(), std::io::Error>(())
+            },
+        )
+        .expect("root path pinning should succeed");
+
+        assert_eq!(
+            calls.len(),
+            1,
+            "root path pinning should only install the file self-bind mount"
+        );
+        let (source, target, resolved_target, flags) = &calls[0];
+        let source = source.as_deref().expect("bind source should be provided");
+        assert!(
+            source.starts_with("/proc/self/fd/"),
+            "bind source should be fd-anchored, got '{source}'"
+        );
+        assert!(
+            target.starts_with("/proc/self/fd/"),
+            "bind target should be fd-anchored, got '{target}'"
+        );
+        assert_eq!(
+            resolved_target, "/",
+            "root path pinning should target the canonical root path"
+        );
+        assert_eq!(*flags, MsFlags::MS_BIND);
     }
 
     #[test]
@@ -828,8 +935,12 @@ mod tests {
                     return false;
                 }
             };
-            if let Err(e) = pin_validated_path_argument(validated.fd.as_raw_fd(), &validated.path) {
-                eprintln!("pin_validated_path_argument failed: {e}");
+            if let Err(e) = pin_parent_chain_for_path(&validated.path) {
+                eprintln!("pin_parent_chain_for_path failed: {e}");
+                return false;
+            }
+            if let Err(e) = pin_path_at_fd(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_path_at_fd failed: {e}");
                 return false;
             }
 
@@ -896,8 +1007,12 @@ mod tests {
                     return false;
                 }
             };
-            if let Err(e) = pin_validated_path_argument(validated.fd.as_raw_fd(), &validated.path) {
-                eprintln!("pin_validated_path_argument failed: {e}");
+            if let Err(e) = pin_parent_chain_for_path(&validated.path) {
+                eprintln!("pin_parent_chain_for_path failed: {e}");
+                return false;
+            }
+            if let Err(e) = pin_path_at_fd(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_path_at_fd failed: {e}");
                 return false;
             }
 
@@ -919,6 +1034,167 @@ mod tests {
         assert!(
             ok,
             "pinning should install a mountpoint at the validated argument path"
+        );
+    }
+
+    #[test]
+    fn test_split_parent_and_file_pinning_targets_expected_paths() {
+        require_root!();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        let parent_path = format!("{base}/owned");
+        let arg_path = format!("{parent_path}/payload.txt");
+        std::fs::create_dir(&parent_path).expect("create parent dir");
+        std::fs::write(&arg_path, b"SAFE").expect("write payload");
+
+        *GLOBAL_PATH.lock().unwrap() = Some(base.clone());
+
+        fn child_fn() -> bool {
+            let base = {
+                let guard = GLOBAL_PATH.lock().unwrap();
+                guard
+                    .as_ref()
+                    .expect("base path should be configured")
+                    .clone()
+            };
+            let parent_path = format!("{base}/owned");
+            let arg_path = format!("{parent_path}/payload.txt");
+
+            if let Err(e) = setup_isolation(&mount_only_settings(), &[]) {
+                eprintln!("setup_isolation failed: {e}");
+                return false;
+            }
+
+            let validated = match check_path(&arg_path, &ValidationContext::Positional, &[]) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("check_path failed: {e}");
+                    return false;
+                }
+            };
+            if let Err(e) = pin_parent_chain_for_path(&validated.path) {
+                eprintln!("pin_parent_chain_for_path failed: {e}");
+                return false;
+            }
+            if let Err(e) = pin_path_at_fd(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_path_at_fd failed: {e}");
+                return false;
+            }
+
+            let mountinfo = match std::fs::read_to_string("/proc/self/mountinfo") {
+                Ok(content) => content,
+                Err(e) => {
+                    eprintln!("failed to read mountinfo: {e}");
+                    return false;
+                }
+            };
+
+            let mut saw_parent = false;
+            let mut saw_file = false;
+            for mountpoint in mountinfo
+                .lines()
+                .filter_map(|line| line.split_whitespace().nth(4))
+            {
+                if mountpoint == parent_path {
+                    saw_parent = true;
+                }
+                if mountpoint == arg_path {
+                    saw_file = true;
+                }
+            }
+            saw_parent && saw_file
+        }
+
+        let ok = unsafe { in_fork(child_fn) };
+        assert!(
+            ok,
+            "split parent/file pinning should lock the provided parent and the argument path"
+        );
+    }
+
+    #[test]
+    fn test_split_parent_and_file_pinning_blocks_grandparent_swap() {
+        require_root!();
+
+        let dir = tempfile::TempDir::new().expect("tempdir");
+        let base = dir.path().to_string_lossy().to_string();
+        let owned_dir = format!("{base}/owned");
+        let owned_subdir = format!("{owned_dir}/sub");
+        let evil_dir = format!("{base}/evil");
+        let evil_subdir = format!("{evil_dir}/sub");
+        let arg_path = format!("{owned_subdir}/payload.txt");
+        std::fs::create_dir(&owned_dir).expect("create owned dir");
+        std::fs::create_dir(&evil_dir).expect("create evil dir");
+        std::fs::create_dir(&owned_subdir).expect("create owned subdir");
+        std::fs::create_dir(&evil_subdir).expect("create evil subdir");
+        std::fs::write(&arg_path, b"SAFE").expect("write safe payload");
+        std::fs::write(format!("{evil_subdir}/payload.txt"), b"EVIL").expect("write evil payload");
+
+        *GLOBAL_PATH.lock().unwrap() = Some(base.clone());
+
+        fn child_fn() -> bool {
+            let base = {
+                let guard = GLOBAL_PATH.lock().unwrap();
+                guard
+                    .as_ref()
+                    .expect("base path should be configured")
+                    .clone()
+            };
+            let owned_dir = format!("{base}/owned");
+            let owned_backup = format!("{base}/owned.backup");
+            let evil_dir = format!("{base}/evil");
+            let arg_path = format!("{base}/owned/sub/payload.txt");
+
+            if let Err(e) = setup_isolation(&mount_only_settings(), &[]) {
+                eprintln!("setup_isolation failed: {e}");
+                return false;
+            }
+
+            let validated = match check_path(&arg_path, &ValidationContext::Positional, &[]) {
+                Ok(path) => path,
+                Err(e) => {
+                    eprintln!("check_path failed: {e}");
+                    return false;
+                }
+            };
+            if let Err(e) = pin_parent_chain_for_path(&validated.path) {
+                eprintln!("pin_parent_chain_for_path failed: {e}");
+                return false;
+            }
+            if let Err(e) = pin_path_at_fd(validated.fd.as_raw_fd(), &validated.path) {
+                eprintln!("pin_path_at_fd failed: {e}");
+                return false;
+            }
+
+            match std::fs::rename(&owned_dir, &owned_backup) {
+                Ok(()) => {
+                    if let Err(e) = std::os::unix::fs::symlink(&evil_dir, &owned_dir) {
+                        eprintln!("symlink swap failed: {e}");
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    if e.raw_os_error() != Some(libc::EBUSY) {
+                        eprintln!("unexpected rename failure after split pinning: {e}");
+                        return false;
+                    }
+                }
+            }
+
+            match std::fs::read_to_string(&arg_path) {
+                Ok(contents) => contents == "SAFE",
+                Err(e) => {
+                    eprintln!("failed reading pinned path: {e}");
+                    false
+                }
+            }
+        }
+
+        let ok = unsafe { in_fork(child_fn) };
+        assert!(
+            ok,
+            "ancestor-chain + file pinning should keep original argument path stable"
         );
     }
 }

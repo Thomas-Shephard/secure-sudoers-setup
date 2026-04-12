@@ -107,17 +107,68 @@ pub(super) fn make_root_private() -> Result<(), Error> {
     })
 }
 
-pub(super) fn pin_validated_path_argument(fd: i32, canonical_path: &str) -> Result<(), Error> {
-    pin_validated_path_argument_with(
-        fd,
-        canonical_path,
-        |_| Ok(()),
-        |source, target, fstype, flags| {
-            mount(source, target, fstype, flags, None::<&str>).map_err(IoError::from)
-        },
+pub(super) fn pin_validated_path_parent(parent_path: &str) -> Result<(), Error> {
+    let parent_path_str = parent_path;
+    let parent_fd = safe_traverse(parent_path_str, false)?;
+    let parent_mountpoint = proc_fd_path(parent_fd.as_raw_fd());
+    mount(
+        Some(parent_mountpoint.as_str()),
+        parent_mountpoint.as_str(),
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
     )
+    .map_err(|e| {
+        Error::IoContext(
+            format!(
+                "Security failure: parent mountpoint lock failed for '{}'",
+                parent_path_str
+            ),
+            IoError::from(e),
+        )
+    })?;
+    Ok(())
 }
 
+pub(super) fn pin_path_at_fd(fd: i32, canonical_path: &str) -> Result<(), Error> {
+    let source_stat = fstat_for_fd(fd, canonical_path)?;
+    let target_fd = safe_traverse(canonical_path, false)?;
+    let target_stat = fstat_for_fd(target_fd.as_raw_fd(), canonical_path)?;
+    if source_stat.st_dev != target_stat.st_dev || source_stat.st_ino != target_stat.st_ino {
+        return Err(Error::Security(format!(
+            "Security failure: path '{}' no longer matches the validated argument",
+            canonical_path
+        )));
+    }
+
+    // The validated argument FD may have been opened before unshare(CLONE_NEWNS).
+    // Use the freshly traversed FD from this namespace as bind source/target, and
+    // rely on the inode/device comparison plus final ensure_path_matches_fd check
+    // to guarantee it still matches the originally validated object.
+    let mount_source = proc_fd_path(target_fd.as_raw_fd());
+    let mount_target = proc_fd_path(target_fd.as_raw_fd());
+    mount(
+        Some(mount_source.as_str()),
+        mount_target.as_str(),
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        Error::IoContext(
+            format!(
+                "Security failure: bind-mount pinning failed for '{}'",
+                canonical_path
+            ),
+            IoError::from(e),
+        )
+    })?;
+
+    ensure_path_matches_fd(canonical_path, fd)?;
+    Ok(())
+}
+
+#[cfg(test)]
 pub(super) fn pin_validated_path_argument_with<BeforeMount, MountFn>(
     fd: i32,
     canonical_path: &str,

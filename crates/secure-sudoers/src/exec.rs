@@ -189,23 +189,39 @@ pub fn execute_securely(
 }
 
 fn pin_validated_path_arguments(cmd: &ValidatedCommand) -> Result<(), Error> {
-    pin_validated_path_arguments_with(cmd, |fd, canonical_path| {
-        crate::isolation::pin_validated_path_argument(fd, canonical_path)
-    })
+    pin_validated_path_arguments_with(
+        cmd,
+        crate::isolation::pin_validated_path_parent,
+        crate::isolation::pin_path_at_fd,
+    )
 }
 
-fn pin_validated_path_arguments_with<PinFn>(
+fn pin_validated_path_arguments_with<PinParentFn, PinArgFn>(
     cmd: &ValidatedCommand,
-    mut pin_fn: PinFn,
+    mut pin_parent_fn: PinParentFn,
+    mut pin_arg_fn: PinArgFn,
 ) -> Result<(), Error>
 where
-    PinFn: FnMut(libc::c_int, &str) -> Result<(), Error>,
+    PinParentFn: FnMut(&str) -> Result<(), Error>,
+    PinArgFn: FnMut(libc::c_int, &str) -> Result<(), Error>,
 {
     use std::os::fd::AsRawFd;
 
     // Deduplicate identical canonical path strings; each unique argv path
     // string is pinned once for all of its occurrences.
     let mut seen_paths = HashSet::<&str>::new();
+    let mut seen_parent_paths = HashSet::<&str>::new();
+
+    pin_parent_chain_for_path(
+        &cmd.binary().path,
+        &mut seen_parent_paths,
+        &mut pin_parent_fn,
+    )?;
+    let binary_path = cmd.binary().path.as_str();
+    if seen_paths.insert(binary_path) {
+        pin_arg_fn(cmd.binary().fd.as_raw_fd(), binary_path)?;
+    }
+
     for arg in cmd.args() {
         let Some(path_arg) = arg.path() else {
             continue;
@@ -216,8 +232,46 @@ where
             continue;
         }
 
-        pin_fn(path_arg.fd.as_raw_fd(), canonical_path)?;
+        pin_parent_chain_for_path(canonical_path, &mut seen_parent_paths, &mut pin_parent_fn)?;
+
+        pin_arg_fn(path_arg.fd.as_raw_fd(), canonical_path)?;
     }
+    Ok(())
+}
+
+fn pin_parent_chain_for_path<'a, PinParentFn>(
+    canonical_path: &'a str,
+    seen_parent_paths: &mut HashSet<&'a str>,
+    pin_parent_fn: &mut PinParentFn,
+) -> Result<(), Error>
+where
+    PinParentFn: FnMut(&str) -> Result<(), Error>,
+{
+    if canonical_path == "/" {
+        return Ok(());
+    }
+
+    // Collect first, then pin root->leaf so each child is pinned only after its
+    // parent path segment has been stabilized.
+    let mut parent_chain = Vec::<&'a str>::new();
+    let mut current_path = canonical_path;
+    loop {
+        let parent_path = crate::isolation::canonical_parent_path(current_path)?;
+        if parent_path == "/" {
+            break;
+        }
+        parent_chain.push(parent_path);
+        current_path = parent_path;
+    }
+
+    for parent_path in parent_chain.into_iter().rev() {
+        // Pin each non-root ancestor once so directory-swap attacks cannot
+        // redirect the validated argv path before delegated exec.
+        if seen_parent_paths.insert(parent_path) {
+            pin_parent_fn(parent_path)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -333,6 +387,7 @@ mod tests {
     use secure_sudoers_common::fs::check_path;
     use secure_sudoers_common::models::{IsolationSettings, ValidationContext};
     use secure_sudoers_common::validator::{ValidatedArg, ValidatedCommand};
+    use std::collections::HashSet;
     use std::sync::Mutex;
     use tempfile::tempdir;
 
@@ -396,10 +451,53 @@ mod tests {
         ValidatedCommand::new_for_testing(cat_binary, args, IsolationSettings::default(), vec![])
     }
 
+    fn parent_chain_excluding_root(canonical_path: &str) -> Vec<String> {
+        let mut chain = Vec::new();
+        let mut current = canonical_path;
+        loop {
+            let Ok(parent) = crate::isolation::canonical_parent_path(current) else {
+                break;
+            };
+            if parent == "/" {
+                break;
+            }
+            chain.push(parent.to_string());
+            current = parent;
+        }
+        chain.reverse();
+        chain
+    }
+
+    fn expected_parent_pin_order(binary_path: &str, arg_paths: &[&str]) -> Vec<String> {
+        let mut expected = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        for path in std::iter::once(binary_path).chain(arg_paths.iter().copied()) {
+            for parent in parent_chain_excluding_root(path) {
+                if seen.insert(parent.clone()) {
+                    expected.push(parent);
+                }
+            }
+        }
+        expected
+    }
+
+    fn expected_file_pin_order(binary_path: &str, arg_paths: &[&str]) -> Vec<String> {
+        let mut expected = Vec::new();
+        let mut seen = HashSet::<String>::new();
+        for path in std::iter::once(binary_path).chain(arg_paths.iter().copied()) {
+            if seen.insert(path.to_string()) {
+                expected.push(path.to_string());
+            }
+        }
+        expected
+    }
+
     #[test]
     fn test_pin_validated_path_arguments_deduplicates_repeated_paths() {
         let dir = tempdir().unwrap();
-        let target = dir.path().join("data.txt");
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let target = nested.join("data.txt");
         std::fs::write(&target, b"SAFE").unwrap();
 
         let path_arg_1 = check_path(
@@ -420,14 +518,30 @@ mod tests {
             ValidatedArg::Path(path_arg_2),
         ]);
 
+        let mut pinned_parent_paths = Vec::<String>::new();
         let mut pinned_paths = Vec::<String>::new();
-        pin_validated_path_arguments_with(&cmd, |_fd, path| {
-            pinned_paths.push(path.to_string());
-            Ok(())
-        })
+        pin_validated_path_arguments_with(
+            &cmd,
+            |parent_path| {
+                pinned_parent_paths.push(parent_path.to_string());
+                Ok(())
+            },
+            |_fd, path| {
+                pinned_paths.push(path.to_string());
+                Ok(())
+            },
+        )
         .unwrap();
 
-        assert_eq!(pinned_paths, vec![target.to_string_lossy().to_string()]);
+        let target_str = target.to_str().unwrap();
+        assert_eq!(
+            pinned_paths,
+            expected_file_pin_order(&cmd.binary().path, &[target_str])
+        );
+        assert_eq!(
+            pinned_parent_paths,
+            expected_parent_pin_order(&cmd.binary().path, &[target_str])
+        );
     }
 
     #[test]
@@ -457,15 +571,95 @@ mod tests {
             ValidatedArg::Path(path_arg_b),
         ]);
 
+        let mut pinned_parent_paths = Vec::<String>::new();
         let mut pinned_paths = Vec::<String>::new();
-        pin_validated_path_arguments_with(&cmd, |_fd, path| {
-            pinned_paths.push(path.to_string());
-            Ok(())
-        })
+        pin_validated_path_arguments_with(
+            &cmd,
+            |parent_path| {
+                pinned_parent_paths.push(parent_path.to_string());
+                Ok(())
+            },
+            |_fd, path| {
+                pinned_paths.push(path.to_string());
+                Ok(())
+            },
+        )
         .unwrap();
 
-        assert_eq!(pinned_paths.len(), 2);
-        assert!(pinned_paths.contains(&path_a.to_string_lossy().to_string()));
-        assert!(pinned_paths.contains(&path_b.to_string_lossy().to_string()));
+        assert_eq!(
+            pinned_paths,
+            expected_file_pin_order(
+                &cmd.binary().path,
+                &[path_a.to_str().unwrap(), path_b.to_str().unwrap()]
+            )
+        );
+        assert_eq!(
+            pinned_parent_paths,
+            expected_parent_pin_order(
+                &cmd.binary().path,
+                &[path_a.to_str().unwrap(), path_b.to_str().unwrap()]
+            )
+        );
+    }
+
+    #[test]
+    fn test_pin_validated_path_arguments_skips_parent_lock_for_root_path() {
+        let root_path_arg = check_path("/", &ValidationContext::Positional, &[]).unwrap();
+        let cmd = build_command_with_args(vec![ValidatedArg::Path(root_path_arg)]);
+
+        let mut pinned_parent_paths = Vec::<String>::new();
+        let mut pinned_paths = Vec::<String>::new();
+        pin_validated_path_arguments_with(
+            &cmd,
+            |parent_path| {
+                pinned_parent_paths.push(parent_path.to_string());
+                Ok(())
+            },
+            |_fd, path| {
+                pinned_paths.push(path.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            pinned_parent_paths,
+            expected_parent_pin_order(&cmd.binary().path, &[]),
+            "root path arguments should skip additional parent-directory pinning"
+        );
+        assert_eq!(
+            pinned_paths,
+            expected_file_pin_order(&cmd.binary().path, &["/"])
+        );
+    }
+
+    #[test]
+    fn test_pin_validated_path_arguments_pins_binary_ancestor_chain() {
+        let cmd = build_command_with_args(vec![ValidatedArg::String("--version".to_string())]);
+
+        let mut pinned_parent_paths = Vec::<String>::new();
+        let mut pinned_paths = Vec::<String>::new();
+        pin_validated_path_arguments_with(
+            &cmd,
+            |parent_path| {
+                pinned_parent_paths.push(parent_path.to_string());
+                Ok(())
+            },
+            |_fd, path| {
+                pinned_paths.push(path.to_string());
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            pinned_paths,
+            expected_file_pin_order(&cmd.binary().path, &[])
+        );
+        assert_eq!(
+            pinned_parent_paths,
+            expected_parent_pin_order(&cmd.binary().path, &[]),
+            "binary path ancestors should still be pinned"
+        );
     }
 }
