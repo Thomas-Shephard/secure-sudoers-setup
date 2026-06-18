@@ -16,7 +16,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Install stable toolchain
         run: rustup toolchain install stable --component rustfmt,clippy --no-self-update
       - name: Cache Cargo
@@ -39,7 +39,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Verify Minimum Kernel Version (4.19+)
         run: |
           kernel_release="$(uname -r)"
