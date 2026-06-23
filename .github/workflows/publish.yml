@@ -48,7 +48,7 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx
       - name: Cache Cargo and Zig
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry/index
